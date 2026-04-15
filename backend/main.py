@@ -1,19 +1,30 @@
 """FastAPI application entry point for the APG 835/837 Rate Analyzer.
 
-Phase 1 endpoints:
+Phase 1 + Phase 2 endpoints:
+
+  Uploads
     POST   /api/upload/835i              Upload one or more 835I files
+    POST   /api/upload/835p              Upload one or more 835P files
+    POST   /api/upload/837               Upload one or more 837I/P files (auto-detected)
+
+  Claims
     GET    /api/claims                   List parsed claims (paginated)
-    GET    /api/claims/{claim_pk}        Claim detail + APG result
+    GET    /api/claims/{claim_pk}        Claim detail + APG result + linked claim
     GET    /api/claims/{claim_pk}/apg    APG calculation breakdown
+
+  Reference lookups (Article 28)
     GET    /api/reference/hcpcs/{code}   HCPCS → EAPG lookup (date-aware)
     GET    /api/reference/icd10/{code}   ICD-10 → EAPG lookup (date-aware)
     GET    /api/reference/apg/{apg}      APG weight lookup (date-aware)
     GET    /api/reference/base-rates     Base-rate listing (filterable)
+
+  Reference lookups (CMS)
+    GET    /api/reference/cms/{code}     CMS MPFS rate (cached, date-aware)
+    GET    /api/reference/zip-locality/{zip}   ZIP → Medicare locality
+
+  Provider config
     POST   /api/config/provider          Upsert provider configuration
     GET    /api/config/provider          Get active provider configuration
-
-Endpoints for 835P/837 parsers, CMS fee schedule, analytics, and exporters
-come in later phases.
 """
 from __future__ import annotations
 
@@ -21,7 +32,6 @@ import logging
 import uuid
 from datetime import date
 from decimal import Decimal
-from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
@@ -42,11 +52,14 @@ from backend.db.database import (
     ParsedServiceLine as ORMLine,
     ProviderConfig,
     ProviderCounty,
+    ZipLocality,
     async_session,
     engine,
     get_session,
 )
 from backend.engines.apg_engine import APGEngine
+from backend.engines.claim_linker import link_and_enrich
+from backend.engines.cms_engine import CMSFeeScheduleEngine
 from backend.models.schemas import (
     APGResult as APGResultOut,
     BaseRateLookupOut,
@@ -58,6 +71,8 @@ from backend.models.schemas import (
     Region,
 )
 from backend.parsers.edi_835i import parse_835i
+from backend.parsers.edi_835p import parse_835p
+from backend.parsers.edi_837 import parse_837
 
 log = logging.getLogger("apg_analyzer")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s  %(message)s")
@@ -70,7 +85,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 app = FastAPI(
     title="APG 835/837 Rate Analyzer",
     version=__version__,
-    description="NYS Medicaid Article 28 APG reimbursement analysis — Phase 1 (835I + APG engine)",
+    description=(
+        "NYS Medicaid Article 28 APG reimbursement analysis. "
+        "Phase 2: 835I + 835P + 837 parsers, APG engine, CMS MPFS engine."
+    ),
 )
 
 app.add_middleware(
@@ -81,16 +99,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_cms_engine: Optional[CMSFeeScheduleEngine] = None
+
 
 @app.on_event("startup")
 async def _startup() -> None:
-    """Ensure tables exist on startup. Does NOT drop; safe to run every launch.
-
-    To (re)load reference data, run `python -m backend.db.init_db --workbook <path>`
-    which drops + recreates + populates.
-    """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    global _cms_engine
+    _cms_engine = CMSFeeScheduleEngine()
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    global _cms_engine
+    if _cms_engine is not None:
+        await _cms_engine.aclose()
+        _cms_engine = None
+
+
+def get_cms_engine() -> CMSFeeScheduleEngine:
+    global _cms_engine
+    if _cms_engine is None:
+        _cms_engine = CMSFeeScheduleEngine()
+    return _cms_engine
 
 
 # ---------------------------------------------------------------------------
@@ -107,8 +139,10 @@ async def health(session: AsyncSession = Depends(get_session)) -> dict:
         ("apg_weights", ApgWeight),
         ("apg_base_rates", ApgBaseRate),
         ("provider_county", ProviderCounty),
+        ("zip_locality", ZipLocality),
     ]:
-        r = await session.execute(select(cls.id if hasattr(cls, "id") else cls.county_code).limit(1))
+        pk = cls.id if hasattr(cls, "id") else cls.county_code
+        r = await session.execute(select(pk).limit(1))
         totals[tbl] = "loaded" if r.first() is not None else "empty"
     return {"status": "ok", "version": __version__, "reference_data": totals}
 
@@ -123,12 +157,6 @@ async def upsert_provider(
     payload: ProviderConfigIn,
     session: AsyncSession = Depends(get_session),
 ) -> ProviderConfigOut:
-    """Save / replace the active provider configuration.
-
-    Phase 1 supports a single active provider. Any existing active row is
-    deactivated and a new one inserted, so history is preserved.
-    """
-    # Resolve region from county if provided
     region = None
     if payload.county_code:
         q = await session.execute(
@@ -191,7 +219,107 @@ def _provider_out(cfg: ProviderConfig) -> ProviderConfigOut:
 
 
 # ---------------------------------------------------------------------------
-# 835I upload
+# Shared persistence + APG calculation
+# ---------------------------------------------------------------------------
+
+
+async def _require_provider(session: AsyncSession) -> ProviderConfig:
+    q = await session.execute(
+        select(ProviderConfig).where(ProviderConfig.is_active.is_(True)).limit(1)
+    )
+    provider = q.scalar_one_or_none()
+    if provider is None:
+        raise HTTPException(400, "No active provider configured. POST /api/config/provider first.")
+    return provider
+
+
+async def _persist_parsed_claim(session, dto, parsed_envelope, batch_id: str) -> ORMClaim:
+    """Convert a Pydantic ParsedClaim DTO to an ORM row + child rows.
+
+    `parsed_envelope` supplies payer info common to all claims in the file;
+    it can be either Parsed835I / Parsed835P / Parsed837.
+    """
+    payer_name = getattr(parsed_envelope, "payer_name", None) or None
+    payer_id = getattr(parsed_envelope, "payer_id", None) or None
+    orm = ORMClaim(
+        file_id=batch_id,
+        file_type=dto.file_type.value,
+        payer_name=payer_name,
+        payer_id=payer_id,
+        provider_npi=dto.provider_npi,
+        provider_name=dto.provider_name,
+        claim_id=dto.claim_id,
+        patient_name=dto.patient_name,
+        patient_id=dto.patient_id,
+        date_of_service=dto.date_of_service,
+        claim_status=dto.claim_status,
+        billed_amount=dto.billed_amount,
+        allowed_amount=dto.allowed_amount,
+        paid_amount=dto.paid_amount,
+        patient_responsibility=dto.patient_responsibility,
+        claim_filing_indicator=dto.claim_filing_indicator,
+        principal_diagnosis=dto.principal_diagnosis,
+        other_diagnoses=list(dto.other_diagnoses) if dto.other_diagnoses else [],
+    )
+    orm.service_lines = [
+        ORMLine(
+            line_seq=sl.line_seq,
+            procedure_code=sl.procedure_code,
+            modifiers=sl.modifiers,
+            revenue_code=sl.revenue_code,
+            billed_amount=sl.billed_amount,
+            allowed_amount=sl.allowed_amount,
+            paid_amount=sl.paid_amount,
+            units=sl.units,
+            date_of_service=sl.date_of_service or dto.date_of_service,
+        )
+        for sl in dto.service_lines
+    ]
+    orm.adjustments = [
+        ORMClaimAdjustment(
+            line_seq=None,
+            group_code=a.group_code,
+            reason_code=a.reason_code,
+            amount=a.amount,
+            quantity=a.quantity,
+        )
+        for a in dto.adjustments
+    ]
+    session.add(orm)
+    await session.flush()
+    return orm
+
+
+async def _run_apg_and_persist(session, dto, orm_claim, provider) -> None:
+    """Run the APG engine and attach the result via the ORM relationship.
+
+    Assigning through `orm_claim.apg_result = ...` (rather than session.add on
+    a bare ORMApgResult) keeps the in-memory relationship consistent, which
+    matters later when link_and_enrich re-fetches the claim and wants to update
+    its apg_result in place.
+    """
+    engine_apg = APGEngine()
+    apg = await engine_apg.calculate(session, dto, provider)
+    orm_claim.apg_result = ORMApgResult(
+        claim_id_fk=orm_claim.id,
+        correct_apg_payment=apg.correct_apg_payment,
+        actual_paid=apg.actual_paid,
+        variance=apg.variance,
+        compression_pct=apg.compression_pct,
+        underpaid=apg.underpaid,
+        overpaid=apg.overpaid,
+        base_rate_applied=apg.base_rate_applied,
+        peer_group=apg.peer_group,
+        region=apg.region.value,
+        discounting_applied=apg.discounting_applied,
+        u6_applied=apg.u6_applied,
+        capital_applied=apg.capital_applied,
+        line_details=[ld.model_dump(mode="json") for ld in apg.line_details],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Upload endpoints
 # ---------------------------------------------------------------------------
 
 
@@ -200,21 +328,8 @@ async def upload_835i(
     files: list[UploadFile] = File(...),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Parse one or more 835I EDI files, persist the claims, and run APG calc.
-
-    Returns a summary per file and total claim count ingested.
-    """
-    # Load active provider — required to run APG engine
-    q = await session.execute(
-        select(ProviderConfig).where(ProviderConfig.is_active.is_(True)).limit(1)
-    )
-    provider = q.scalar_one_or_none()
-    if provider is None:
-        raise HTTPException(400, "No active provider configured. POST /api/config/provider first.")
-
-    engine_apg = APGEngine()
-    results = []
-    total_claims = 0
+    provider = await _require_provider(session)
+    results, total_claims, all_claim_ids = [], 0, []
 
     for up in files:
         batch_id = uuid.uuid4().hex[:12]
@@ -224,92 +339,116 @@ async def upload_835i(
         except Exception as e:
             results.append({"file": up.filename, "error": str(e)})
             continue
-
-        per_file_summary = {
-            "file": up.filename,
-            "file_id": batch_id,
+        summary = {
+            "file": up.filename, "file_id": batch_id,
             "claims_parsed": len(parsed.claims),
-            "payer": parsed.payer_name,
-            "payee": parsed.payee_name,
-            "payment_amount": str(parsed.payment_amount),
-            "claim_ids": [],
+            "payer": parsed.payer_name, "payee": parsed.payee_name,
+            "payment_amount": str(parsed.payment_amount), "claim_ids": [],
         }
-
         for dto in parsed.claims:
             dto.file_id = batch_id
-            orm_claim = ORMClaim(
-                file_id=batch_id,
-                file_type=dto.file_type.value,
-                payer_name=parsed.payer_name or None,
-                payer_id=parsed.payer_id or None,
-                provider_npi=dto.provider_npi,
-                provider_name=dto.provider_name,
-                claim_id=dto.claim_id,
-                patient_name=dto.patient_name,
-                patient_id=dto.patient_id,
-                date_of_service=dto.date_of_service,
-                claim_status=dto.claim_status,
-                billed_amount=dto.billed_amount,
-                allowed_amount=dto.allowed_amount,
-                paid_amount=dto.paid_amount,
-                patient_responsibility=dto.patient_responsibility,
-                claim_filing_indicator=dto.claim_filing_indicator,
-                principal_diagnosis=dto.principal_diagnosis,
-                other_diagnoses=list(dto.other_diagnoses) if dto.other_diagnoses else [],
-            )
-            orm_claim.service_lines = [
-                ORMLine(
-                    line_seq=sl.line_seq,
-                    procedure_code=sl.procedure_code,
-                    modifiers=sl.modifiers,
-                    revenue_code=sl.revenue_code,
-                    billed_amount=sl.billed_amount,
-                    allowed_amount=sl.allowed_amount,
-                    paid_amount=sl.paid_amount,
-                    units=sl.units,
-                    date_of_service=sl.date_of_service or dto.date_of_service,
-                )
-                for sl in dto.service_lines
-            ]
-            orm_claim.adjustments = [
-                ORMClaimAdjustment(
-                    line_seq=None,
-                    group_code=a.group_code,
-                    reason_code=a.reason_code,
-                    amount=a.amount,
-                    quantity=a.quantity,
-                )
-                for a in dto.adjustments
-            ]
-            session.add(orm_claim)
-            await session.flush()
-
-            # Run APG calc
-            apg = await engine_apg.calculate(session, dto, provider)
-            orm_apg = ORMApgResult(
-                claim_id_fk=orm_claim.id,
-                correct_apg_payment=apg.correct_apg_payment,
-                actual_paid=apg.actual_paid,
-                variance=apg.variance,
-                compression_pct=apg.compression_pct,
-                underpaid=apg.underpaid,
-                overpaid=apg.overpaid,
-                base_rate_applied=apg.base_rate_applied,
-                peer_group=apg.peer_group,
-                region=apg.region.value,
-                discounting_applied=apg.discounting_applied,
-                u6_applied=apg.u6_applied,
-                capital_applied=apg.capital_applied,
-                line_details=[ld.model_dump(mode="json") for ld in apg.line_details],
-            )
-            session.add(orm_apg)
-            per_file_summary["claim_ids"].append(dto.claim_id)
+            orm = await _persist_parsed_claim(session, dto, parsed, batch_id)
+            await _run_apg_and_persist(session, dto, orm, provider)
+            summary["claim_ids"].append(dto.claim_id)
+            all_claim_ids.append(dto.claim_id)
             total_claims += 1
-
         await session.commit()
-        results.append(per_file_summary)
+        results.append(summary)
 
-    return {"files_processed": len(files), "total_claims": total_claims, "results": results}
+    enrichment = await link_and_enrich(session, all_claim_ids, provider)
+    await session.commit()
+    return {
+        "files_processed": len(files), "total_claims": total_claims,
+        "results": results, "enrichment": enrichment,
+    }
+
+
+@app.post("/api/upload/835p")
+async def upload_835p(
+    files: list[UploadFile] = File(...),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    provider = await _require_provider(session)
+    results, total_claims, all_claim_ids = [], 0, []
+
+    for up in files:
+        batch_id = uuid.uuid4().hex[:12]
+        raw = (await up.read()).decode("utf-8", errors="replace")
+        try:
+            parsed = parse_835p(raw)
+        except Exception as e:
+            results.append({"file": up.filename, "error": str(e)})
+            continue
+        summary = {
+            "file": up.filename, "file_id": batch_id,
+            "claims_parsed": len(parsed.claims),
+            "payer": parsed.payer_name, "payee": parsed.payee_name,
+            "payment_amount": str(parsed.payment_amount), "claim_ids": [],
+        }
+        for dto in parsed.claims:
+            dto.file_id = batch_id
+            orm = await _persist_parsed_claim(session, dto, parsed, batch_id)
+            # 835P claims don't get APG calc (they're non-Article 28) — CMS comparison
+            # will be available on-demand via /api/reference/cms/{code}.
+            summary["claim_ids"].append(dto.claim_id)
+            all_claim_ids.append(dto.claim_id)
+            total_claims += 1
+        await session.commit()
+        results.append(summary)
+
+    enrichment = await link_and_enrich(session, all_claim_ids, provider)
+    await session.commit()
+    return {
+        "files_processed": len(files), "total_claims": total_claims,
+        "results": results, "enrichment": enrichment,
+    }
+
+
+@app.post("/api/upload/837")
+async def upload_837(
+    files: list[UploadFile] = File(...),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Upload 837 claim files (institutional or professional; auto-detected).
+
+    After persisting the claims, the claim-linker runs to enrich any matching
+    835 remittances with diagnosis codes from these 837 submissions and
+    re-compute APG on the enriched records.
+    """
+    provider = await _require_provider(session)
+    results, total_claims, all_claim_ids = [], 0, []
+
+    for up in files:
+        batch_id = uuid.uuid4().hex[:12]
+        raw = (await up.read()).decode("utf-8", errors="replace")
+        try:
+            parsed = parse_837(raw)
+        except Exception as e:
+            results.append({"file": up.filename, "error": str(e)})
+            continue
+        summary = {
+            "file": up.filename, "file_id": batch_id,
+            "file_type": parsed.file_type.value,
+            "claims_parsed": len(parsed.claims),
+            "submitter": parsed.submitter_name,
+            "billing_provider": parsed.billing_provider_name,
+            "claim_ids": [],
+        }
+        for dto in parsed.claims:
+            dto.file_id = batch_id
+            orm = await _persist_parsed_claim(session, dto, parsed, batch_id)
+            summary["claim_ids"].append(dto.claim_id)
+            all_claim_ids.append(dto.claim_id)
+            total_claims += 1
+        await session.commit()
+        results.append(summary)
+
+    enrichment = await link_and_enrich(session, all_claim_ids, provider)
+    await session.commit()
+    return {
+        "files_processed": len(files), "total_claims": total_claims,
+        "results": results, "enrichment": enrichment,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -330,22 +469,16 @@ async def list_claims(
     stmt = stmt.offset(offset).limit(limit)
     res = await session.execute(stmt)
     claims = res.scalars().all()
-
     return {
-        "count": len(claims),
-        "offset": offset,
-        "limit": limit,
+        "count": len(claims), "offset": offset, "limit": limit,
         "items": [
             {
-                "id": c.id,
-                "claim_id": c.claim_id,
-                "file_type": c.file_type,
+                "id": c.id, "claim_id": c.claim_id, "file_type": c.file_type,
                 "date_of_service": c.date_of_service.isoformat() if c.date_of_service else None,
-                "provider_npi": c.provider_npi,
-                "patient_name": c.patient_name,
-                "billed_amount": str(c.billed_amount),
-                "paid_amount": str(c.paid_amount),
+                "provider_npi": c.provider_npi, "patient_name": c.patient_name,
+                "billed_amount": str(c.billed_amount), "paid_amount": str(c.paid_amount),
                 "claim_status": c.claim_status,
+                "linked_claim_id_fk": c.linked_claim_id_fk,
             }
             for c in claims
         ],
@@ -357,16 +490,24 @@ async def get_claim(claim_pk: int, session: AsyncSession = Depends(get_session))
     claim = await session.get(ORMClaim, claim_pk)
     if claim is None:
         raise HTTPException(404, "Claim not found")
+
+    linked = None
+    if claim.linked_claim_id_fk:
+        linked_claim = await session.get(ORMClaim, claim.linked_claim_id_fk)
+        if linked_claim:
+            linked = {
+                "id": linked_claim.id,
+                "file_type": linked_claim.file_type,
+                "claim_id": linked_claim.claim_id,
+                "billed_amount": str(linked_claim.billed_amount),
+                "paid_amount": str(linked_claim.paid_amount),
+            }
+
     return {
-        "id": claim.id,
-        "file_id": claim.file_id,
-        "file_type": claim.file_type,
-        "payer_name": claim.payer_name,
-        "payer_id": claim.payer_id,
-        "provider_npi": claim.provider_npi,
-        "provider_name": claim.provider_name,
-        "claim_id": claim.claim_id,
-        "patient_name": claim.patient_name,
+        "id": claim.id, "file_id": claim.file_id, "file_type": claim.file_type,
+        "payer_name": claim.payer_name, "payer_id": claim.payer_id,
+        "provider_npi": claim.provider_npi, "provider_name": claim.provider_name,
+        "claim_id": claim.claim_id, "patient_name": claim.patient_name,
         "patient_id": claim.patient_id,
         "date_of_service": claim.date_of_service.isoformat() if claim.date_of_service else None,
         "claim_status": claim.claim_status,
@@ -377,27 +518,20 @@ async def get_claim(claim_pk: int, session: AsyncSession = Depends(get_session))
         "claim_filing_indicator": claim.claim_filing_indicator,
         "principal_diagnosis": claim.principal_diagnosis,
         "other_diagnoses": claim.other_diagnoses or [],
+        "linked_claim": linked,
         "service_lines": [
             {
-                "line_seq": sl.line_seq,
-                "procedure_code": sl.procedure_code,
-                "modifiers": sl.modifiers or [],
-                "revenue_code": sl.revenue_code,
-                "billed_amount": str(sl.billed_amount),
-                "allowed_amount": str(sl.allowed_amount),
-                "paid_amount": str(sl.paid_amount),
-                "units": sl.units,
+                "line_seq": sl.line_seq, "procedure_code": sl.procedure_code,
+                "modifiers": sl.modifiers or [], "revenue_code": sl.revenue_code,
+                "billed_amount": str(sl.billed_amount), "allowed_amount": str(sl.allowed_amount),
+                "paid_amount": str(sl.paid_amount), "units": sl.units,
                 "date_of_service": sl.date_of_service.isoformat() if sl.date_of_service else None,
             }
             for sl in claim.service_lines
         ],
         "adjustments": [
-            {
-                "group_code": a.group_code,
-                "reason_code": a.reason_code,
-                "amount": str(a.amount),
-                "quantity": a.quantity,
-            }
+            {"group_code": a.group_code, "reason_code": a.reason_code,
+             "amount": str(a.amount), "quantity": a.quantity}
             for a in claim.adjustments
         ],
         "apg_result": (
@@ -433,27 +567,23 @@ async def get_claim_apg(claim_pk: int, session: AsyncSession = Depends(get_sessi
         "actual_paid": str(apg.actual_paid),
         "variance": str(apg.variance),
         "compression_pct": str(apg.compression_pct),
-        "underpaid": apg.underpaid,
-        "overpaid": apg.overpaid,
+        "underpaid": apg.underpaid, "overpaid": apg.overpaid,
         "base_rate_applied": str(apg.base_rate_applied),
-        "peer_group": apg.peer_group,
-        "region": apg.region,
+        "peer_group": apg.peer_group, "region": apg.region,
         "discounting_applied": apg.discounting_applied,
-        "u6_applied": apg.u6_applied,
-        "capital_applied": apg.capital_applied,
+        "u6_applied": apg.u6_applied, "capital_applied": apg.capital_applied,
         "line_details": apg.line_details,
     }
 
 
 # ---------------------------------------------------------------------------
-# Reference lookups
+# Reference lookups — Article 28
 # ---------------------------------------------------------------------------
 
 
 @app.get("/api/reference/hcpcs/{code}", response_model=HcpcsLookupOut)
 async def lookup_hcpcs(
-    code: str,
-    dos: date = Query(..., description="Date of service (YYYY-MM-DD) for effective-date matching"),
+    code: str, dos: date = Query(...),
     session: AsyncSession = Depends(get_session),
 ) -> HcpcsLookupOut:
     apg = APGEngine()
@@ -461,21 +591,15 @@ async def lookup_hcpcs(
     if row is None:
         raise HTTPException(404, f"No EAPG mapping for HCPCS {code} on {dos.isoformat()}")
     return HcpcsLookupOut(
-        hcpcs=row.hcpcs,
-        description=row.description,
-        eapg=row.eapg,
-        eapg_desc=row.eapg_desc,
-        eapg_type=row.eapg_type,
-        eapg_category=row.eapg_category,
-        quarter_effective_date=row.quarter_effective_date,
-        quarter_end_date=row.quarter_end_date,
+        hcpcs=row.hcpcs, description=row.description, eapg=row.eapg,
+        eapg_desc=row.eapg_desc, eapg_type=row.eapg_type, eapg_category=row.eapg_category,
+        quarter_effective_date=row.quarter_effective_date, quarter_end_date=row.quarter_end_date,
     )
 
 
 @app.get("/api/reference/icd10/{code}", response_model=Icd10LookupOut)
 async def lookup_icd10(
-    code: str,
-    dos: date = Query(...),
+    code: str, dos: date = Query(...),
     session: AsyncSession = Depends(get_session),
 ) -> Icd10LookupOut:
     apg = APGEngine()
@@ -483,20 +607,15 @@ async def lookup_icd10(
     if row is None:
         raise HTTPException(404, f"No EAPG mapping for DX {code} on {dos.isoformat()}")
     return Icd10LookupOut(
-        dx_code=row.dx_code,
-        description=row.description,
-        gender=row.gender,
-        eapg=row.eapg,
-        eapg_desc=row.eapg_desc,
-        eapg_type=row.eapg_type,
+        dx_code=row.dx_code, description=row.description, gender=row.gender,
+        eapg=row.eapg, eapg_desc=row.eapg_desc, eapg_type=row.eapg_type,
         effective_date=row.effective_date,
     )
 
 
 @app.get("/api/reference/apg/{apg_code}", response_model=ApgWeightLookupOut)
 async def lookup_apg_weight(
-    apg_code: int,
-    dos: date = Query(...),
+    apg_code: int, dos: date = Query(...),
     session: AsyncSession = Depends(get_session),
 ) -> ApgWeightLookupOut:
     apg = APGEngine()
@@ -504,8 +623,7 @@ async def lookup_apg_weight(
     if row is None:
         raise HTTPException(404, f"No weight history for APG {apg_code} on {dos.isoformat()}")
     return ApgWeightLookupOut(
-        apg=row.apg, weight=row.weight,
-        effective_date=row.effective_date,
+        apg=row.apg, weight=row.weight, effective_date=row.effective_date,
         is_final_rate=row.is_final_rate, year_rate=row.year_rate,
     )
 
@@ -534,3 +652,73 @@ async def list_base_rates(
         )
         for r in res.scalars().all()
     ]
+
+
+# ---------------------------------------------------------------------------
+# Reference lookups — CMS
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/reference/cms/{code}")
+async def lookup_cms_rate(
+    code: str,
+    dos: date = Query(..., description="Date of service; year is used for the rate lookup"),
+    modifier: str = Query("", description="2-char modifier, optional"),
+    locality: Optional[str] = Query(None, description="CMS locality number; defaults to provider config"),
+    force_refresh: bool = Query(False, description="Ignore cache and refetch from CMS API"),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    # Resolve locality from provider config if not supplied
+    if not locality:
+        q = await session.execute(
+            select(ProviderConfig).where(ProviderConfig.is_active.is_(True)).limit(1)
+        )
+        provider = q.scalar_one_or_none()
+        if provider is None or not provider.cms_locality:
+            raise HTTPException(
+                400,
+                "No locality supplied and active provider has no cms_locality set. "
+                "Either pass ?locality=... or set it in the provider config.",
+            )
+        locality = provider.cms_locality
+
+    cms = get_cms_engine()
+    row = await cms.get_mpfs_rate(session, code, modifier, locality, dos.year, force_refresh=force_refresh)
+    if row is None:
+        raise HTTPException(
+            404,
+            f"No CMS MPFS rate found for HCPCS {code}, modifier {modifier!r}, "
+            f"locality {locality}, year {dos.year}. "
+            "Verify the code exists in the MPFS and that the locality number is correct.",
+        )
+
+    return {
+        "hcpcs": row.hcpcs, "modifier": row.modifier, "locality": row.locality, "year": row.year,
+        "non_facility_rate": str(row.non_facility_rate) if row.non_facility_rate is not None else None,
+        "facility_rate": str(row.facility_rate) if row.facility_rate is not None else None,
+        "work_rvu": str(row.work_rvu) if row.work_rvu is not None else None,
+        "pe_rvu": str(row.pe_rvu) if row.pe_rvu is not None else None,
+        "mp_rvu": str(row.mp_rvu) if row.mp_rvu is not None else None,
+        "total_rvu": str(row.total_rvu) if row.total_rvu is not None else None,
+        "conversion_factor": str(row.conversion_factor) if row.conversion_factor is not None else None,
+        "cached_at": row.cached_at.isoformat() + "Z",
+        "cached_until": row.cached_until.isoformat() + "Z",
+    }
+
+
+@app.get("/api/reference/zip-locality/{zip_code}")
+async def lookup_zip_locality(
+    zip_code: str,
+    year: Optional[int] = Query(None, description="Year for the lookup (most recent if omitted)"),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    cms = get_cms_engine()
+    locality = await cms.get_locality_from_zip(session, zip_code, year=year)
+    if locality is None:
+        raise HTTPException(
+            404,
+            f"No locality found for ZIP {zip_code}. "
+            "The zip_locality table may be empty; run `python -m backend.db.init_zip_locality "
+            "--file <path>` to load the CMS ZIP5 file.",
+        )
+    return {"zip_code": cms.normalize_zip(zip_code), "locality": locality}

@@ -5,7 +5,7 @@ Parses Electronic Remittance Advice (**835I**) and Claim (**837**) files
 against the NYS DOH APG methodology to detect underpayments, packaging
 errors, and compression.
 
-**Status:** Phase 1 (backend foundation). See [Roadmap](#roadmap) for what's
+**Status:** Phase 2 (parsers + CMS). See [Roadmap](#roadmap) for what's
 landed and what's next.
 
 ---
@@ -180,21 +180,37 @@ curl http://localhost:8000/api/health
 
 ---
 
-## API surface (Phase 1)
+## API surface
 
-| Method | Path                              | Description                          |
-|--------|-----------------------------------|--------------------------------------|
-| GET    | `/api/health`                     | Liveness + reference-data status     |
-| POST   | `/api/config/provider`            | Upsert active provider config        |
-| GET    | `/api/config/provider`            | Get active provider config           |
-| POST   | `/api/upload/835i`                | Upload & analyze one or more 835I    |
-| GET    | `/api/claims`                     | List parsed claims (paginated)       |
-| GET    | `/api/claims/{id}`                | Claim detail (+ APG result)          |
-| GET    | `/api/claims/{id}/apg`            | APG result for a single claim        |
-| GET    | `/api/reference/hcpcs/{code}?dos=` | HCPCS → EAPG lookup                  |
-| GET    | `/api/reference/icd10/{code}?dos=` | ICD-10 → EAPG lookup                 |
-| GET    | `/api/reference/apg/{apg}?dos=`   | APG weight lookup                    |
-| GET    | `/api/reference/base-rates`       | List base rates (filterable)         |
+| Method | Path                                 | Phase | Description                                     |
+|--------|--------------------------------------|-------|-------------------------------------------------|
+| GET    | `/api/health`                        | 1     | Liveness + reference-data status                |
+| POST   | `/api/config/provider`               | 1     | Upsert active provider config                   |
+| GET    | `/api/config/provider`               | 1     | Get active provider config                      |
+| POST   | `/api/upload/835i`                   | 1     | Upload & analyze 835I institutional remittance  |
+| POST   | `/api/upload/835p`                   | 2     | Upload 835P professional remittance             |
+| POST   | `/api/upload/837`                    | 2     | Upload 837I/P claim submissions (auto-detected) |
+| GET    | `/api/claims`                        | 1     | List parsed claims (paginated)                  |
+| GET    | `/api/claims/{id}`                   | 1/2   | Claim detail + APG result + linked sibling      |
+| GET    | `/api/claims/{id}/apg`               | 1     | APG result for a single claim                   |
+| GET    | `/api/reference/hcpcs/{code}?dos=`   | 1     | HCPCS → EAPG lookup                             |
+| GET    | `/api/reference/icd10/{code}?dos=`   | 1     | ICD-10 → EAPG lookup                            |
+| GET    | `/api/reference/apg/{apg}?dos=`      | 1     | APG weight lookup                               |
+| GET    | `/api/reference/base-rates`          | 1     | List base rates (filterable)                    |
+| GET    | `/api/reference/cms/{code}?dos=`     | 2     | CMS MPFS rate (cached, live fallback)           |
+| GET    | `/api/reference/zip-locality/{zip}`  | 2     | ZIP → Medicare locality                         |
+
+### Upload behavior & auto-enrichment (Phase 2)
+
+Every 835I / 835P / 837 upload triggers the claim linker:
+- When a claim ID appears in both an 837 submission and an 835 remittance,
+  the two records are linked via `linked_claim_id_fk`.
+- The 835 is enriched with diagnosis codes from the matching 837 (if it
+  didn't already have them).
+- The APG engine re-runs on the enriched 835 record automatically.
+
+This makes it safe to upload in either order — 835 first then 837, or 837
+first then 835. The final APG result reflects the full context.
 
 ---
 
@@ -257,9 +273,25 @@ ROUND_HALF_UP on exit. Float never touches the money path.
 | Phase | Scope                                                          | Status   |
 |-------|----------------------------------------------------------------|----------|
 | 1     | Backend foundation, 835I parser, APG engine, reference data    | ✅ landed |
-| 2     | 835P + 837 parsers, CMS MPFS engine with caching               | pending  |
+| 2     | 835P + 837 parsers, CMS MPFS engine, 837↔835 auto-enrichment   | ✅ landed |
 | 3     | React + Vite + Tailwind SPA (Dashboard, Upload, Claims)        | pending  |
 | 4     | Analytics engine, Excel + PDF exporters                        | pending  |
+
+### Loading CMS data (Phase 2 — optional)
+
+The CMS MPFS rate lookup needs a ZIP → locality mapping. Download the annual
+"ZIP Code to Carrier Locality File" from
+<https://www.cms.gov/medicare/medicare-fee-service-payments/physicianfeesched/zip-code-carrier-locality-file>
+and load it:
+
+```bash
+python -m backend.db.init_zip_locality --file "C:/path/to/ZIP5_OCT2025.xlsx"
+```
+
+The loader is tolerant to column-name variations across annual releases. CSV
+files are also accepted. If you don't load this file, CMS lookups still work
+as long as you pass `?locality=...` explicitly or set `cms_locality` in the
+provider config.
 
 ---
 

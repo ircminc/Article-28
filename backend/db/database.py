@@ -184,6 +184,58 @@ class ProviderCounty(Base):
     region: Mapped[str] = mapped_column(String(16))
 
 
+class ZipLocality(Base):
+    """CMS ZIP code → Medicare locality mapping. Source: annual CMS ZIP5 file at
+    https://www.cms.gov/medicare/medicare-fee-service-payments/physicianfeesched/
+    zip-code-carrier-locality-file. Populated by `backend.db.init_zip_locality`.
+    """
+    __tablename__ = "zip_locality"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    zip_code: Mapped[str] = mapped_column(String(10), index=True)
+    state: Mapped[Optional[str]] = mapped_column(String(2))
+    carrier_number: Mapped[Optional[str]] = mapped_column(String(16))
+    locality_number: Mapped[str] = mapped_column(String(8), index=True)
+    locality_name: Mapped[Optional[str]] = mapped_column(String(128))
+    rural_indicator: Mapped[Optional[str]] = mapped_column(String(4))
+    plus4_flag: Mapped[Optional[str]] = mapped_column(String(4))
+    effective_year: Mapped[Optional[int]] = mapped_column(Integer, index=True)
+
+    __table_args__ = (
+        Index("ix_zip_locality_lookup", "zip_code", "effective_year"),
+    )
+
+
+class CmsRateCache(Base):
+    """Cache of CMS Medicare Physician Fee Schedule API responses.
+
+    Keyed by (hcpcs, modifier, locality, year). `cached_until` is an absolute
+    UTC timestamp; the CMS engine treats rows with cached_until < now as stale.
+    Stale rows are still returned if the API is unreachable (soft cache).
+    """
+    __tablename__ = "cms_rate_cache"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    hcpcs: Mapped[str] = mapped_column(String(12), index=True)
+    modifier: Mapped[str] = mapped_column(String(4), default="")
+    locality: Mapped[str] = mapped_column(String(8), index=True)
+    year: Mapped[int] = mapped_column(Integer, index=True)
+    non_facility_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 4))
+    facility_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 4))
+    work_rvu: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4))
+    pe_rvu: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4))
+    mp_rvu: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4))
+    total_rvu: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4))
+    conversion_factor: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4))
+    raw_payload: Mapped[Optional[dict]] = mapped_column(JSON)  # full API response for auditing
+    cached_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    cached_until: Mapped[datetime] = mapped_column(DateTime, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("hcpcs", "modifier", "locality", "year", name="uq_cms_cache_key"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Operational tables
 # ---------------------------------------------------------------------------
@@ -238,6 +290,14 @@ class ParsedClaim(Base):
     claim_filing_indicator: Mapped[Optional[str]] = mapped_column(String(4))  # CLP09
     principal_diagnosis: Mapped[Optional[str]] = mapped_column(String(16))
     other_diagnoses: Mapped[Optional[dict]] = mapped_column(JSON)   # list[str]
+
+    # 837/835 linkage: when an 837 and 835 share a claim_id, we set linked_claim_id_fk
+    # to point at the sibling so we can show both sides in the detail view. Enrichment
+    # (merging dx codes from 837 → 835) is done at upload time and reflected in the
+    # fields above.
+    linked_claim_id_fk: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("parsed_claim.id", ondelete="SET NULL"), index=True, nullable=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
