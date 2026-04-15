@@ -1,0 +1,48 @@
+# APG 835/837 Rate Analyzer — local Docker stack
+#
+# Phase 1: backend service only. The frontend service is declared but points at
+# a Dockerfile that does not yet exist; uncomment and build it in Phase 3.
+#
+# Usage:
+#   docker compose build
+#   docker compose up -d backend
+#   # On first run, initialize reference data from the source workbook:
+#   docker compose run --rm backend \
+#       python -m backend.db.init_db \
+#       --workbook /app/workbooks/Sample\ APG\ Fee\ Calculator.xlsx
+#   # Then check health:
+#   curl http://localhost:8000/api/health
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: apg-analyzer-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist SQLite DB and file artifacts across container rebuilds
+      - ./backend/data:/app/backend/data
+      - ./backend/uploads:/app/backend/uploads
+      - ./backend/exports:/app/backend/exports
+      # Mount the source workbook directory so init_db can read it.
+      # Override this path in your local .env if needed.
+      - ${WORKBOOK_DIR:-./workbooks}:/app/workbooks:ro
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:///./backend/data/apg_analyzer.db
+      - CMS_API_CACHE_TTL=86400
+      - LOG_LEVEL=INFO
+    restart: unless-stopped
+
+  # Phase 3:
+  # frontend:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.frontend
+  #   ports:
+  #     - "3000:3000"
+  #   depends_on:
+  #     - backend
+  #   environment:
+  #     - VITE_API_URL=http://localhost:8000

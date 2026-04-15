@@ -1,0 +1,242 @@
+"""Pydantic v2 schemas shared across parsers, engines, and API layer.
+
+These are the DTOs — not ORM classes (those live in db/database.py). The parser
+returns a ParsedClaim built from one of these; the APG engine consumes it.
+"""
+from __future__ import annotations
+
+from datetime import date
+from decimal import Decimal
+from enum import Enum
+from typing import Optional
+
+from pydantic import BaseModel, Field, ConfigDict
+
+
+# ---------------------------------------------------------------------------
+# File / claim enums
+# ---------------------------------------------------------------------------
+
+
+class FileType(str, Enum):
+    ERA_835I = "835I"
+    ERA_835P = "835P"
+    CLAIM_837I = "837I"
+    CLAIM_837P = "837P"
+
+
+class ClaimFilingIndicator(str, Enum):
+    """CLP09 — Claim Filing Indicator. Not exhaustive; most common codes only."""
+    MEDICARE_A = "MA"
+    MEDICARE_B = "MB"
+    MEDICAID = "MC"
+    COMMERCIAL = "CI"
+    HMO = "HM"
+    BLUE_CROSS = "BL"
+    OTHER = "ZZ"
+
+
+class AdjustmentGroupCode(str, Enum):
+    CONTRACTUAL = "CO"
+    PATIENT_RESPONSIBILITY = "PR"
+    OTHER_ADJUSTMENT = "OA"
+    PAYER_INITIATED = "PI"
+    CORRECTION_REVERSAL = "CR"
+
+
+# ---------------------------------------------------------------------------
+# Adjustments
+# ---------------------------------------------------------------------------
+
+
+class ClaimAdjustment(BaseModel):
+    """A single adjustment from a CAS segment (claim-level)."""
+    group_code: str = Field(..., description="CO, PR, OA, PI, or CR")
+    reason_code: str = Field(..., description="CARC code")
+    amount: Decimal
+    quantity: Optional[int] = None
+
+
+class ServiceAdjustment(ClaimAdjustment):
+    """CAS segment at service-line level. Same shape; different scope."""
+
+
+# ---------------------------------------------------------------------------
+# Claim structures (parser output)
+# ---------------------------------------------------------------------------
+
+
+class ServiceLine(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    line_seq: int
+    procedure_code: str
+    modifiers: list[str] = Field(default_factory=list)
+    revenue_code: Optional[str] = None
+    billed_amount: Decimal = Decimal("0")
+    allowed_amount: Decimal = Decimal("0")
+    paid_amount: Decimal = Decimal("0")
+    units: int = 1
+    date_of_service: Optional[date] = None
+    adjustments: list[ServiceAdjustment] = Field(default_factory=list)
+
+
+class ParsedClaim(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    file_type: FileType
+    file_id: Optional[str] = None  # upload batch id
+    payer_name: Optional[str] = None
+    payer_id: Optional[str] = None
+    provider_npi: Optional[str] = None
+    provider_name: Optional[str] = None
+    claim_id: str                   # CLP01
+    patient_name: Optional[str] = None
+    patient_id: Optional[str] = None
+    date_of_service: Optional[date] = None
+    claim_status: Optional[str] = None
+    billed_amount: Decimal = Decimal("0")
+    allowed_amount: Decimal = Decimal("0")
+    paid_amount: Decimal = Decimal("0")
+    patient_responsibility: Decimal = Decimal("0")
+    claim_filing_indicator: Optional[str] = None
+    principal_diagnosis: Optional[str] = None
+    other_diagnoses: list[str] = Field(default_factory=list)
+    service_lines: list[ServiceLine] = Field(default_factory=list)
+    adjustments: list[ClaimAdjustment] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Provider configuration
+# ---------------------------------------------------------------------------
+
+
+class ProviderType(str, Enum):
+    DTC = "dtc"            # Diagnostic and Treatment Center / freestanding clinic
+    HOSPITAL = "hospital"  # Hospital outpatient department
+
+
+class Region(str, Enum):
+    UPSTATE = "Upstate"
+    DOWNSTATE = "Downstate"
+
+
+class ProviderConfigIn(BaseModel):
+    """Payload for POST /api/config/provider."""
+    provider_name: str
+    npi: Optional[str] = None
+    county_code: Optional[int] = None
+    peer_group: str                 # e.g. 'Clinic*'
+    provider_type: ProviderType
+    capital_addon_eligible: bool = False
+    capital_addon_rate: Optional[Decimal] = None
+    rate_code_override: Optional[str] = None
+    cms_locality: Optional[str] = None
+
+
+class ProviderConfigOut(ProviderConfigIn):
+    id: int
+    region: Optional[Region] = None  # derived from county
+
+
+# ---------------------------------------------------------------------------
+# APG engine outputs
+# ---------------------------------------------------------------------------
+
+
+class EapgType(str, Enum):
+    SIGNIFICANT_PROCEDURE = "Significant Procedure"
+    MEDICAL_VISIT = "Medical Visit"
+    ANCILLARY = "Ancillary"
+    INCIDENTAL = "Incidental"
+    ADD_ON = "Add-On"
+    UNKNOWN = "Unknown"
+
+
+class APGLineResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    line_seq: int
+    procedure_code: str
+    modifiers: list[str] = Field(default_factory=list)
+    eapg: Optional[int] = None
+    eapg_desc: Optional[str] = None
+    eapg_type: EapgType = EapgType.UNKNOWN
+    eapg_category: Optional[str] = None
+    weight: Optional[Decimal] = None
+    base_rate: Decimal
+    expected_payment: Decimal = Decimal("0")
+    actual_paid: Decimal = Decimal("0")
+    variance: Decimal = Decimal("0")
+    # Explain what happened
+    packaged: bool = False
+    discounted: bool = False              # paid at 50% due to multi-procedure rule
+    u6_applied: bool = False
+    denied: bool = False
+    notes: list[str] = Field(default_factory=list)
+
+
+class APGResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    claim_id: str
+    date_of_service: Optional[date] = None
+    peer_group: str
+    region: Region
+    base_rate_applied: Decimal
+    correct_apg_payment: Decimal
+    actual_paid: Decimal
+    variance: Decimal
+    compression_pct: Decimal
+    underpaid: bool
+    overpaid: bool
+    discounting_applied: bool
+    u6_applied: bool
+    capital_applied: bool
+    capital_addon_amount: Decimal = Decimal("0")
+    line_details: list[APGLineResult]
+    notes: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Reference lookup outputs
+# ---------------------------------------------------------------------------
+
+
+class HcpcsLookupOut(BaseModel):
+    hcpcs: str
+    description: Optional[str] = None
+    eapg: int
+    eapg_desc: Optional[str] = None
+    eapg_type: Optional[str] = None
+    eapg_category: Optional[str] = None
+    quarter_effective_date: Optional[date] = None
+    quarter_end_date: Optional[date] = None
+
+
+class Icd10LookupOut(BaseModel):
+    dx_code: str
+    description: Optional[str] = None
+    gender: Optional[str] = None
+    eapg: int
+    eapg_desc: Optional[str] = None
+    eapg_type: Optional[str] = None
+    effective_date: Optional[date] = None
+
+
+class ApgWeightLookupOut(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    apg: int
+    weight: Decimal
+    effective_date: date
+    is_final_rate: bool
+    year_rate: Optional[int] = None
+
+
+class BaseRateLookupOut(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    source: str
+    peer_group: str
+    region: Region
+    effective_date: date
+    rate: Decimal

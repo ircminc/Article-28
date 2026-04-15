@@ -1,0 +1,50 @@
+# PHI — never commit real EDI files
+*.edi
+*.835
+*.837
+backend/uploads/
+backend/exports/
+
+# Reference-data outputs are regenerable from the source workbook.
+# CSV snapshots are excluded by default because ICD-10 descriptions (WHO) and
+# HCPCS descriptions (AMA/CMS) may carry licensing restrictions for public
+# redistribution. If the target repo is private and the reference content is
+# cleared for distribution, you can remove the *.csv line below and commit.
+backend/data/*.db
+backend/data/*.db-journal
+backend/data/*.csv
+
+# Env
+.env
+.env.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Node / React (Phase 3)
+node_modules/
+dist/
+.vite/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Scratch (local-only exploration files)
+_scratch/
+
+# Claude Code per-user settings (tool permissions). Shared settings.json is OK to commit.
+.claude/settings.local.json
+
+# Stray SQLite files if someone runs with a legacy CWD-relative DB path
+/data/
