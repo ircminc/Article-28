@@ -1,9 +1,13 @@
-# PHI — never commit real EDI files
+# PHI — never commit real EDI files.
+# Synthetic fixtures under tests/ are explicitly allowed (negation rule below).
 *.edi
 *.835
 *.837
 backend/uploads/
 backend/exports/
+!backend/tests/fixtures/*.edi
+!backend/tests/fixtures/*.835
+!backend/tests/fixtures/*.837
 
 # Reference-data outputs are regenerable from the source workbook.
 # CSV snapshots are excluded by default because ICD-10 descriptions (WHO) and
