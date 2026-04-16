@@ -1,7 +1,7 @@
 {
   "name": "apg-analyzer-frontend",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.5.0",
   "type": "module",
   "description": "APG 835/837 Rate Analyzer frontend — React + Vite + Tailwind",
   "scripts": {

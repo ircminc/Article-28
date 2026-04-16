@@ -1,0 +1,79 @@
+# Production overlay. Compose it alongside the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.production.yml up -d
+#
+# What this overlay adds vs. the base compose:
+#   - Required env vars promoted to ${VAR:?} form so compose refuses to start
+#     if they're missing (fail-fast for the JWT secret + admin bootstrap).
+#   - Secrets delivered via environment (ECS/App Runner/Cloud Run style).
+#   - `init-reference` and `init-admin` one-shot services used during
+#     initial deployment, then disabled by profile.
+#   - backend service gets `restart: always` and tighter healthcheck
+#     grace period since data is already loaded in prod.
+#
+# Production secret handling:
+#   Do NOT paste secrets into this file or the default .env. The recommended
+#   pattern depending on host:
+#     AWS ECS / App Runner  : wire env vars from AWS Secrets Manager / SSM
+#     Azure Container Apps  : env vars from Key Vault secret references
+#     GCP Cloud Run         : env vars from Secret Manager secrets
+#   All three platforms inject these as environment variables at runtime,
+#   exactly as this file expects.
+
+services:
+  backend:
+    environment:
+      # REQUIRED — the JWT signing secret. 32+ bytes, random.
+      - APP_JWT_SECRET=${APP_JWT_SECRET:?APP_JWT_SECRET must be set (32+ bytes)}
+      # Optional — JWT lifetime in minutes (default 480 = 8h)
+      - APP_JWT_EXPIRES_MIN=${APP_JWT_EXPIRES_MIN:-480}
+      - DATABASE_URL=${DATABASE_URL:-sqlite+aiosqlite:///./backend/data/apg_analyzer.db}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    restart: always
+    # Tighter healthcheck once we're past the initial boot
+    healthcheck:
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  frontend:
+    environment:
+      - NODE_ENV=production
+    restart: always
+
+  # One-shot service that loads the NYS DOH workbook into SQLite. Runs only
+  # when explicitly invoked with the `init` profile:
+  #   docker compose --profile init run --rm init-reference
+  init-reference:
+    profiles: ["init"]
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    volumes:
+      - ./backend/data:/app/backend/data
+      - ${WORKBOOK_DIR:-./workbooks}:/app/workbooks:ro
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-sqlite+aiosqlite:///./backend/data/apg_analyzer.db}
+    entrypoint: ["python", "-m", "backend.db.init_db"]
+    command: ["--workbook", "/app/workbooks/${WORKBOOK_FILENAME:?WORKBOOK_FILENAME must be set}"]
+
+  # One-shot admin bootstrap. Reads APP_ADMIN_USERNAME and APP_ADMIN_PASSWORD
+  # from env ONLY — never from argv.
+  #   APP_ADMIN_USERNAME=admin APP_ADMIN_PASSWORD=... docker compose \
+  #     --profile init run --rm init-admin
+  init-admin:
+    profiles: ["init"]
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    volumes:
+      - ./backend/data:/app/backend/data
+    environment:
+      - APP_ADMIN_USERNAME=${APP_ADMIN_USERNAME:?set APP_ADMIN_USERNAME}
+      - APP_ADMIN_PASSWORD=${APP_ADMIN_PASSWORD:?set APP_ADMIN_PASSWORD}
+      - APP_ADMIN_FULLNAME=${APP_ADMIN_FULLNAME:-}
+      - APP_ADMIN_EMAIL=${APP_ADMIN_EMAIL:-}
+      - DATABASE_URL=${DATABASE_URL:-sqlite+aiosqlite:///./backend/data/apg_analyzer.db}
+    entrypoint: ["python", "-m", "backend.db.init_admin"]
+    command: []

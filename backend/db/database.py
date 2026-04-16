@@ -206,6 +206,59 @@ class ZipLocality(Base):
     )
 
 
+class UserAccount(Base):
+    """A single human user of the system.
+
+    Roles (Phase 5):
+        admin   — can create/disable users, change passwords
+        analyst — standard billing analyst; can upload and view claims
+        viewer  — read-only; cannot upload or change provider config
+
+    Password hashes use Argon2 (see backend.security). We never store plaintext.
+    disabled=True is a soft-delete that preserves audit history.
+    """
+    __tablename__ = "user_account"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    full_name: Mapped[Optional[str]] = mapped_column(String(128))
+    email: Mapped[Optional[str]] = mapped_column(String(128))
+    password_hash: Mapped[str] = mapped_column(String(256))
+    role: Mapped[str] = mapped_column(String(16), default="analyst", index=True)
+    disabled: Mapped[bool] = mapped_column(default=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    password_changed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class AuditLogEntry(Base):
+    """One row per security-relevant action. HIPAA-aligned access log.
+
+    `action` values we emit (Phase 5):
+        login.success, login.failure, logout,
+        user.create, user.disable, user.password_change,
+        upload.835i, upload.835p, upload.837,
+        export.excel, export.pdf,
+        provider.update
+
+    `resource` is free-form context — claim IDs, usernames affected, file IDs.
+    `ip_address` is captured from X-Forwarded-For (trusted proxy) or peer IP.
+    """
+    __tablename__ = "audit_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("user_account.id", ondelete="SET NULL"), index=True
+    )
+    username_at_event: Mapped[Optional[str]] = mapped_column(String(64))
+    action: Mapped[str] = mapped_column(String(64), index=True)
+    resource: Mapped[Optional[str]] = mapped_column(String(512))
+    ip_address: Mapped[Optional[str]] = mapped_column(String(45))
+    success: Mapped[bool] = mapped_column(default=True)
+    details: Mapped[Optional[dict]] = mapped_column(JSON)
+
+
 class CmsRateCache(Base):
     """Cache of CMS Medicare Physician Fee Schedule API responses.
 

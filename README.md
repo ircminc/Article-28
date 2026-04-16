@@ -5,7 +5,10 @@ Parses Electronic Remittance Advice (**835I**) and Claim (**837**) files
 against the NYS DOH APG methodology to detect underpayments, packaging
 errors, and compression.
 
-**Status:** Phase 4 (analytics + exporters). All four spec phases landed.
+**Status:** Phase 5 (auth + cloud-ready deployment). All four spec phases + auth landed.
+
+For cloud deployment instructions (AWS ECS, Azure Container Apps, GCP Cloud
+Run) see [**DEPLOY.md**](./DEPLOY.md).
 
 ---
 
@@ -323,6 +326,7 @@ ROUND_HALF_UP on exit. Float never touches the money path.
 | 2     | 835P + 837 parsers, CMS MPFS engine, 837↔835 auto-enrichment   | ✅ landed |
 | 3     | React + Vite + Tailwind SPA (Dashboard, Upload, Claims)        | ✅ landed |
 | 4     | Analytics engine, Excel + PDF exporters, Reports page, Recharts | ✅ landed |
+| 5     | Per-user login, RBAC, audit log, hardened Docker, cloud deploy guide | ✅ landed |
 
 ### Loading CMS data (Phase 2 — optional)
 

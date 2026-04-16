@@ -34,7 +34,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from sqlalchemy import delete, select
@@ -58,6 +58,8 @@ from backend.db.database import (
     engine,
     get_session,
 )
+from backend.auth_routes import admin_router, auth_router
+from backend.deps import CurrentUser, RequireAdmin, RequireAnalyst, audit
 from backend.engines.analytics_engine import AnalyticsEngine
 from backend.engines.apg_engine import APGEngine
 from backend.engines.claim_linker import link_and_enrich
@@ -103,6 +105,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Auth + admin routes (Phase 5). Mounted early so they take priority.
+app.include_router(auth_router)
+app.include_router(admin_router)
 
 _cms_engine: Optional[CMSFeeScheduleEngine] = None
 
@@ -160,6 +166,8 @@ async def health(session: AsyncSession = Depends(get_session)) -> dict:
 @app.post("/api/config/provider", response_model=ProviderConfigOut)
 async def upsert_provider(
     payload: ProviderConfigIn,
+    current: RequireAnalyst,
+    request: Request,
     session: AsyncSession = Depends(get_session),
 ) -> ProviderConfigOut:
     region = None
@@ -190,13 +198,22 @@ async def upsert_provider(
         cms_locality=payload.cms_locality,
     )
     session.add(cfg)
+    await session.flush()
+    await audit(
+        session, user=current, request=request,
+        action="provider.update", resource=cfg.provider_name,
+        details={"peer_group": cfg.peer_group, "region": cfg.region},
+    )
     await session.commit()
     await session.refresh(cfg)
     return _provider_out(cfg)
 
 
 @app.get("/api/config/provider", response_model=ProviderConfigOut)
-async def get_active_provider(session: AsyncSession = Depends(get_session)) -> ProviderConfigOut:
+async def get_active_provider(
+    current: CurrentUser,
+    session: AsyncSession = Depends(get_session),
+) -> ProviderConfigOut:
     q = await session.execute(
         select(ProviderConfig).where(ProviderConfig.is_active.is_(True)).limit(1)
     )
@@ -330,6 +347,8 @@ async def _run_apg_and_persist(session, dto, orm_claim, provider) -> None:
 
 @app.post("/api/upload/835i")
 async def upload_835i(
+    current: RequireAnalyst,
+    request: Request,
     files: list[UploadFile] = File(...),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -361,6 +380,12 @@ async def upload_835i(
         results.append(summary)
 
     enrichment = await link_and_enrich(session, all_claim_ids, provider)
+    await audit(
+        session, user=current, request=request,
+        action="upload.835i",
+        resource=f"{len(files)} file(s), {total_claims} claim(s)",
+        details={"file_names": [up.filename for up in files]},
+    )
     await session.commit()
     return {
         "files_processed": len(files), "total_claims": total_claims,
@@ -370,6 +395,8 @@ async def upload_835i(
 
 @app.post("/api/upload/835p")
 async def upload_835p(
+    current: RequireAnalyst,
+    request: Request,
     files: list[UploadFile] = File(...),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -402,6 +429,12 @@ async def upload_835p(
         results.append(summary)
 
     enrichment = await link_and_enrich(session, all_claim_ids, provider)
+    await audit(
+        session, user=current, request=request,
+        action="upload.835p",
+        resource=f"{len(files)} file(s), {total_claims} claim(s)",
+        details={"file_names": [up.filename for up in files]},
+    )
     await session.commit()
     return {
         "files_processed": len(files), "total_claims": total_claims,
@@ -411,6 +444,8 @@ async def upload_835p(
 
 @app.post("/api/upload/837")
 async def upload_837(
+    current: RequireAnalyst,
+    request: Request,
     files: list[UploadFile] = File(...),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -449,6 +484,12 @@ async def upload_837(
         results.append(summary)
 
     enrichment = await link_and_enrich(session, all_claim_ids, provider)
+    await audit(
+        session, user=current, request=request,
+        action="upload.837",
+        resource=f"{len(files)} file(s), {total_claims} claim(s)",
+        details={"file_names": [up.filename for up in files]},
+    )
     await session.commit()
     return {
         "files_processed": len(files), "total_claims": total_claims,
@@ -463,6 +504,7 @@ async def upload_837(
 
 @app.get("/api/claims")
 async def list_claims(
+    current: CurrentUser,
     file_type: Optional[str] = Query(None, pattern="^(835I|835P|837I|837P)$"),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
@@ -491,7 +533,11 @@ async def list_claims(
 
 
 @app.get("/api/claims/{claim_pk}")
-async def get_claim(claim_pk: int, session: AsyncSession = Depends(get_session)) -> dict:
+async def get_claim(
+    claim_pk: int,
+    current: CurrentUser,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
     claim = await session.get(ORMClaim, claim_pk)
     if claim is None:
         raise HTTPException(404, "Claim not found")
@@ -561,7 +607,11 @@ async def get_claim(claim_pk: int, session: AsyncSession = Depends(get_session))
 
 
 @app.get("/api/claims/{claim_pk}/apg")
-async def get_claim_apg(claim_pk: int, session: AsyncSession = Depends(get_session)) -> dict:
+async def get_claim_apg(
+    claim_pk: int,
+    current: CurrentUser,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
     claim = await session.get(ORMClaim, claim_pk)
     if claim is None or claim.apg_result is None:
         raise HTTPException(404, "Claim or APG result not found")
@@ -588,7 +638,9 @@ async def get_claim_apg(claim_pk: int, session: AsyncSession = Depends(get_sessi
 
 @app.get("/api/reference/hcpcs/{code}", response_model=HcpcsLookupOut)
 async def lookup_hcpcs(
-    code: str, dos: date = Query(...),
+    code: str,
+    current: CurrentUser,
+    dos: date = Query(...),
     session: AsyncSession = Depends(get_session),
 ) -> HcpcsLookupOut:
     apg = APGEngine()
@@ -604,7 +656,9 @@ async def lookup_hcpcs(
 
 @app.get("/api/reference/icd10/{code}", response_model=Icd10LookupOut)
 async def lookup_icd10(
-    code: str, dos: date = Query(...),
+    code: str,
+    current: CurrentUser,
+    dos: date = Query(...),
     session: AsyncSession = Depends(get_session),
 ) -> Icd10LookupOut:
     apg = APGEngine()
@@ -620,7 +674,9 @@ async def lookup_icd10(
 
 @app.get("/api/reference/apg/{apg_code}", response_model=ApgWeightLookupOut)
 async def lookup_apg_weight(
-    apg_code: int, dos: date = Query(...),
+    apg_code: int,
+    current: CurrentUser,
+    dos: date = Query(...),
     session: AsyncSession = Depends(get_session),
 ) -> ApgWeightLookupOut:
     apg = APGEngine()
@@ -635,6 +691,7 @@ async def lookup_apg_weight(
 
 @app.get("/api/reference/base-rates")
 async def list_base_rates(
+    current: CurrentUser,
     source: Optional[str] = Query(None, pattern="^(dtc|hospital)$"),
     peer_group: Optional[str] = Query(None),
     region: Optional[str] = Query(None, pattern="^(Upstate|Downstate)$"),
@@ -667,6 +724,7 @@ async def list_base_rates(
 @app.get("/api/reference/cms/{code}")
 async def lookup_cms_rate(
     code: str,
+    current: CurrentUser,
     dos: date = Query(..., description="Date of service; year is used for the rate lookup"),
     modifier: str = Query("", description="2-char modifier, optional"),
     locality: Optional[str] = Query(None, description="CMS locality number; defaults to provider config"),
@@ -714,6 +772,7 @@ async def lookup_cms_rate(
 @app.get("/api/reference/zip-locality/{zip_code}")
 async def lookup_zip_locality(
     zip_code: str,
+    current: CurrentUser,
     year: Optional[int] = Query(None, description="Year for the lookup (most recent if omitted)"),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -750,6 +809,7 @@ def _analytics_filters(date_from, date_to, payer_name, file_type, provider_npi) 
 
 @app.get("/api/analytics/summary")
 async def analytics_summary(
+    current: CurrentUser,
     date_from: Optional[date] = Query(None),
     date_to: Optional[date] = Query(None),
     payer_name: Optional[str] = Query(None),
@@ -764,6 +824,7 @@ async def analytics_summary(
 
 @app.get("/api/analytics/compression")
 async def analytics_compression(
+    current: CurrentUser,
     group_by: str = Query("eapg", pattern="^(eapg|procedure|peer_group|region|date_year)$"),
     limit: int = Query(20, ge=1, le=200),
     date_from: Optional[date] = Query(None),
@@ -781,6 +842,7 @@ async def analytics_compression(
 
 @app.get("/api/analytics/denials")
 async def analytics_denials(
+    current: CurrentUser,
     limit: int = Query(20, ge=1, le=200),
     date_from: Optional[date] = Query(None),
     date_to: Optional[date] = Query(None),
@@ -797,6 +859,7 @@ async def analytics_denials(
 
 @app.get("/api/analytics/trends")
 async def analytics_trends(
+    current: CurrentUser,
     period: str = Query("monthly", pattern="^(monthly|quarterly)$"),
     date_from: Optional[date] = Query(None),
     date_to: Optional[date] = Query(None),
@@ -813,6 +876,7 @@ async def analytics_trends(
 
 @app.get("/api/analytics/payer-scorecard")
 async def analytics_payer_scorecard(
+    current: CurrentUser,
     date_from: Optional[date] = Query(None),
     date_to: Optional[date] = Query(None),
     payer_name: Optional[str] = Query(None),
@@ -991,10 +1055,19 @@ async def _fetch_claims_for_export(
 
 
 @app.post("/api/export/excel")
-async def export_excel(opts: ExportOptions, session: AsyncSession = Depends(get_session)) -> Response:
+async def export_excel(
+    opts: ExportOptions,
+    current: CurrentUser,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
     payload = await _gather_export_payload(session, opts)
     blob = ExcelExporter().build(payload)
     fname = f"apg_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    await audit(session, user=current, request=request,
+                action="export.excel", resource=fname,
+                details={"bytes": len(blob)})
+    await session.commit()
     return Response(
         content=blob,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1003,10 +1076,19 @@ async def export_excel(opts: ExportOptions, session: AsyncSession = Depends(get_
 
 
 @app.post("/api/export/pdf")
-async def export_pdf(opts: ExportOptions, session: AsyncSession = Depends(get_session)) -> Response:
+async def export_pdf(
+    opts: ExportOptions,
+    current: CurrentUser,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
     payload = await _gather_export_payload(session, opts)
     blob = PDFExporter().build(payload, max_claims=opts.pdf_max_claims)
     fname = f"apg_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
+    await audit(session, user=current, request=request,
+                action="export.pdf", resource=fname,
+                details={"bytes": len(blob)})
+    await session.commit()
     return Response(
         content=blob,
         media_type="application/pdf",

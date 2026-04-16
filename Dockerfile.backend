@@ -1,28 +1,82 @@
-# APG 835/837 Rate Analyzer — backend image
+# APG 835/837 Rate Analyzer — backend image (Phase 5 hardened)
 # Build from the repo root:
 #     docker build -t apg-analyzer-backend -f Dockerfile.backend .
-FROM python:3.12-slim
+#
+# Hardening:
+#   - Multi-stage so the final image doesn't carry the build toolchain
+#   - Runs as a non-root user (uid 1000) — important for HIPAA-eligible hosts
+#     that enforce Pod Security Admission / nonroot constraints
+#   - HEALTHCHECK hits /api/health so the orchestrator can route traffic
+#     only when reference data is loaded
+#   - Gunicorn + uvicorn worker class for production-grade serving
+#   - Reference-data + uploads + exports mounted as volumes (no PHI in image)
+
+# ---------- Build stage -----------------------------------------------------
+FROM python:3.12-slim AS build
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
+WORKDIR /wheel
+COPY backend/requirements.txt /wheel/requirements.txt
+# Also install gunicorn in the runtime image below
+RUN pip wheel --wheel-dir=/wheel/wheels -r /wheel/requirements.txt gunicorn==23.0.0
+
+
+# ---------- Runtime stage ---------------------------------------------------
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Non-root user
+RUN groupadd -r apg --gid=1000 \
+ && useradd -r -g apg --uid=1000 --home-dir=/app --shell=/sbin/nologin apg
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-# Install Python deps first for better layer caching
+# Install wheels built above, no index access needed
+COPY --from=build /wheel/wheels /wheel/wheels
 COPY backend/requirements.txt /app/backend/requirements.txt
-RUN pip install -r /app/backend/requirements.txt
+RUN pip install --no-index --find-links=/wheel/wheels \
+     -r /app/backend/requirements.txt gunicorn==23.0.0 \
+ && rm -rf /wheel
 
-# Copy source
-COPY backend /app/backend
+COPY --chown=apg:apg backend /app/backend
 
-# Runtime-created dirs (volume mounts will back these in docker-compose)
-RUN mkdir -p /app/backend/data /app/backend/uploads /app/backend/exports
+# Data dirs are volume mounts in production
+RUN mkdir -p /app/backend/data /app/backend/uploads /app/backend/exports \
+ && chown -R apg:apg /app/backend/data /app/backend/uploads /app/backend/exports
+
+USER apg:apg
 
 EXPOSE 8000
 
-# Reference data is NOT baked into the image (it's PHI-adjacent and versioned separately).
-# Initialize it once by running:
-#   docker compose run --rm backend python -m backend.db.init_db --workbook /app/workbooks/ref.xlsx
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8000/api/health || exit 1
+
+# Reference data is NOT baked into the image (no PHI / no proprietary NYS DOH
+# content). Initialize it once with the workbook mounted at /app/workbooks:
+#   docker compose run --rm backend \
+#     python -m backend.db.init_db --workbook /app/workbooks/ref.xlsx
+# Bootstrap the first admin once (password via env var, never on command line):
+#   APP_ADMIN_USERNAME=admin APP_ADMIN_PASSWORD=... docker compose run --rm \
+#     backend python -m backend.db.init_admin
+
+# Gunicorn + uvicorn worker: 2 workers is appropriate for a small team
+# deployment. Tune via GUNICORN_CMD_ARGS if needed.
+CMD ["gunicorn", "backend.main:app", \
+     "--bind", "0.0.0.0:8000", \
+     "--worker-class", "uvicorn.workers.UvicornWorker", \
+     "--workers", "2", \
+     "--timeout", "120", \
+     "--access-logfile", "-", \
+     "--forwarded-allow-ips=*"]

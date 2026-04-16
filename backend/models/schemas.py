@@ -5,7 +5,7 @@ returns a ParsedClaim built from one of these; the APG engine consumes it.
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Optional
@@ -270,3 +270,72 @@ class ExportOptions(BaseModel):
     include_835p: bool = True
     # Soft cap on per-claim PDF detail pages; the Excel report always has all claims.
     pdf_max_claims: int = Field(default=25, ge=1, le=500)
+
+
+# ---------------------------------------------------------------------------
+# Auth (Phase 5)
+# ---------------------------------------------------------------------------
+
+
+class UserRole(str, Enum):
+    ADMIN = "admin"
+    ANALYST = "analyst"
+    VIEWER = "viewer"
+
+
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+class TokenOut(BaseModel):
+    """Response of /api/auth/login."""
+    access_token: str
+    token_type: str = "bearer"
+    expires_at: datetime
+    user: "UserOut"
+
+
+class UserOut(BaseModel):
+    """Public-facing user representation. Never includes password hash."""
+    id: int
+    username: str
+    full_name: Optional[str] = None
+    email: Optional[str] = None
+    role: UserRole
+    disabled: bool = False
+    created_at: datetime
+    last_login_at: Optional[datetime] = None
+
+
+class UserCreate(BaseModel):
+    """Admin-only payload for POST /api/admin/users."""
+    username: str = Field(..., min_length=3, max_length=64)
+    full_name: Optional[str] = None
+    email: Optional[str] = None
+    role: UserRole = UserRole.ANALYST
+    password: str = Field(..., min_length=10, max_length=128)
+
+
+class UserUpdate(BaseModel):
+    """Admin payload for PATCH /api/admin/users/{id}. All fields optional."""
+    full_name: Optional[str] = None
+    email: Optional[str] = None
+    role: Optional[UserRole] = None
+    disabled: Optional[bool] = None
+
+
+class PasswordChangeIn(BaseModel):
+    """Self-service password change. Requires the current password to prevent
+    a stolen session from pivoting to full account takeover."""
+    current_password: str
+    new_password: str = Field(..., min_length=10, max_length=128)
+
+
+class AdminPasswordResetIn(BaseModel):
+    """Admin resetting another user's password; no current-password check."""
+    new_password: str = Field(..., min_length=10, max_length=128)
+
+
+# Resolve forward refs (TokenOut.user)
+TokenOut.model_rebuild()

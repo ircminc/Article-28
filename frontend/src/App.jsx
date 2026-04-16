@@ -6,21 +6,46 @@ import Claims from './pages/Claims.jsx';
 import ClaimDetail from './pages/ClaimDetail.jsx';
 import Reports from './pages/Reports.jsx';
 import Settings from './pages/Settings.jsx';
+import Login from './pages/Login.jsx';
+import Users from './pages/Users.jsx';
+import RequireAuth from './auth/RequireAuth.jsx';
+import { AuthProvider } from './auth/AuthContext.jsx';
 
 export default function App() {
   return (
-    <Routes>
-      <Route path="/" element={<Layout />}>
-        <Route index element={<Navigate to="/dashboard" replace />} />
-        <Route path="dashboard" element={<Dashboard />} />
-        <Route path="upload" element={<Upload />} />
-        <Route path="claims" element={<Claims />} />
-        <Route path="claims/:id" element={<ClaimDetail />} />
-        <Route path="reports" element={<Reports />} />
-        <Route path="settings" element={<Settings />} />
-        <Route path="*" element={<NotFound />} />
-      </Route>
-    </Routes>
+    <AuthProvider>
+      <Routes>
+        {/* Public route: the login screen */}
+        <Route path="/login" element={<Login />} />
+
+        {/* All other routes require authentication. */}
+        <Route
+          path="/"
+          element={
+            <RequireAuth>
+              <Layout />
+            </RequireAuth>
+          }
+        >
+          <Route index element={<Navigate to="/dashboard" replace />} />
+          <Route path="dashboard" element={<Dashboard />} />
+          <Route path="upload" element={<Upload />} />
+          <Route path="claims" element={<Claims />} />
+          <Route path="claims/:id" element={<ClaimDetail />} />
+          <Route path="reports" element={<Reports />} />
+          <Route path="settings" element={<Settings />} />
+          <Route
+            path="users"
+            element={
+              <RequireAuth role="admin">
+                <Users />
+              </RequireAuth>
+            }
+          />
+          <Route path="*" element={<NotFound />} />
+        </Route>
+      </Routes>
+    </AuthProvider>
   );
 }
 
