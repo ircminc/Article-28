@@ -278,6 +278,150 @@ async def test_cms_missing_rate_returns_error_on_line(clean_db, client):
 
 
 @pytest.mark.asyncio
+async def test_cms_pc_tc_split_when_opted_in(clean_db, client):
+    """When cms_include_pc_tc=true, each line is enriched with professional
+    (-26) and technical (-TC) rates fetched from additional CMS lookups.
+    Codes with no PC/TC split (e.g. E/M) return None for those fields."""
+    token = await _make_analyst()
+    await _seed_provider(cms_locality="01")
+
+    async def fake_get_mpfs(self, session, hcpcs, modifier, locality, year, **_):
+        # Only procedure '70450' (hypothetical radiology) has a PC/TC split
+        # in this fixture. '99213' (E/M) does not.
+        from backend.db.database import CmsRateCache
+        from datetime import datetime, timedelta
+        now = datetime.utcnow()
+        if hcpcs == "70450":
+            if modifier == "26":
+                return CmsRateCache(
+                    hcpcs=hcpcs, modifier="26", locality=locality, year=year,
+                    non_facility_rate=Decimal("42.00"),
+                    cached_at=now, cached_until=now + timedelta(hours=24),
+                )
+            if modifier == "TC":
+                return CmsRateCache(
+                    hcpcs=hcpcs, modifier="TC", locality=locality, year=year,
+                    non_facility_rate=Decimal("78.00"),
+                    cached_at=now, cached_until=now + timedelta(hours=24),
+                )
+            return CmsRateCache(
+                hcpcs=hcpcs, modifier="", locality=locality, year=year,
+                non_facility_rate=Decimal("120.00"),
+                cached_at=now, cached_until=now + timedelta(hours=24),
+            )
+        if hcpcs == "99213":
+            if modifier in ("26", "TC"):
+                return None   # no PC/TC split for E/M codes
+            return CmsRateCache(
+                hcpcs=hcpcs, modifier="", locality=locality, year=year,
+                non_facility_rate=Decimal("92.47"),
+                cached_at=now, cached_until=now + timedelta(hours=24),
+            )
+        return None
+
+    with patch(
+        "backend.engines.cms_engine.CMSFeeScheduleEngine.get_mpfs_rate",
+        new=fake_get_mpfs,
+    ):
+        r = client.post("/api/calculator/calculate",
+                        headers={"Authorization": f"Bearer {token}"},
+                        json={
+                            "date_of_service": "2023-06-15",
+                            "service_lines": [
+                                {"procedure_code": "70450"},
+                                {"procedure_code": "99213"},
+                            ],
+                            "target": "cms",
+                            "cms_include_pc_tc": True,
+                        })
+    assert r.status_code == 200, r.text
+    lines = r.json()["cms_lines"]
+
+    # 70450 has PC/TC split
+    assert Decimal(lines[0]["non_facility_rate"]) == Decimal("120.00")
+    assert Decimal(lines[0]["professional_rate"]) == Decimal("42.00")
+    assert Decimal(lines[0]["technical_rate"]) == Decimal("78.00")
+
+    # 99213 doesn't — professional and technical are null
+    assert Decimal(lines[1]["non_facility_rate"]) == Decimal("92.47")
+    assert lines[1]["professional_rate"] is None
+    assert lines[1]["technical_rate"] is None
+
+
+@pytest.mark.asyncio
+async def test_cms_pc_tc_off_by_default(clean_db, client):
+    """Without the flag, professional/technical fields are null for every line."""
+    token = await _make_analyst()
+    await _seed_provider(cms_locality="01")
+
+    call_count = {"n": 0}
+
+    async def fake_get_mpfs(self, session, hcpcs, modifier, locality, year, **_):
+        call_count["n"] += 1
+        from backend.db.database import CmsRateCache
+        from datetime import datetime, timedelta
+        now = datetime.utcnow()
+        return CmsRateCache(
+            hcpcs=hcpcs, modifier=modifier, locality=locality, year=year,
+            non_facility_rate=Decimal("100.00"),
+            cached_at=now, cached_until=now + timedelta(hours=24),
+        )
+
+    with patch(
+        "backend.engines.cms_engine.CMSFeeScheduleEngine.get_mpfs_rate",
+        new=fake_get_mpfs,
+    ):
+        r = client.post("/api/calculator/calculate",
+                        headers={"Authorization": f"Bearer {token}"},
+                        json={
+                            "date_of_service": "2023-06-15",
+                            "service_lines": [{"procedure_code": "99213"}],
+                            "target": "cms",
+                            # cms_include_pc_tc not passed — defaults to False
+                        })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["cms_lines"][0]["professional_rate"] is None
+    assert body["cms_lines"][0]["technical_rate"] is None
+    # Only ONE lookup fired, not three
+    assert call_count["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_apg_variance_uses_paid_field(clean_db, client):
+    """The form's Paid $ (per line) must drive the APG variance calculation.
+    If paid total equals correct APG, variance = 0 and compression = 0."""
+    token = await _make_analyst()
+    await _seed_provider()
+
+    # First call: no paid amount — variance should equal the full correct APG
+    r = client.post("/api/calculator/calculate",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={
+                        "date_of_service": "2023-06-15",
+                        "service_lines": [{"procedure_code": "17000"}],
+                        "target": "apg",
+                    })
+    assert r.status_code == 200
+    apg = r.json()["apg"]
+    correct = Decimal(apg["correct_apg_payment"])
+    assert Decimal(apg["variance"]) == correct   # full underpayment vs $0
+
+    # Second call: paid = correct. Variance should be 0.
+    r = client.post("/api/calculator/calculate",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={
+                        "date_of_service": "2023-06-15",
+                        "service_lines": [
+                            {"procedure_code": "17000", "billed_amount": str(correct)},
+                        ],
+                        "target": "apg",
+                    })
+    apg2 = r.json()["apg"]
+    assert Decimal(apg2["variance"]) == Decimal("0")
+
+
+@pytest.mark.asyncio
 async def test_both_returns_apg_and_cms(clean_db, client):
     token = await _make_analyst()
     await _seed_provider(cms_locality="01")

@@ -370,13 +370,26 @@ class CalculatorIn(BaseModel):
     # CMS-specific overrides (otherwise pulled from the active provider config)
     cms_locality: Optional[str] = None
     cms_use_facility_rate: bool = False
+    # When true, the CMS lookup ALSO fetches professional-component (-26) and
+    # technical-component (-TC) rates in parallel alongside the global rate.
+    # Off by default to keep the common case fast (one CMS API call per line).
+    cms_include_pc_tc: bool = False
 
 
 class CalculatorLineCMS(BaseModel):
     """CMS MPFS result for a single line."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
+    # Echo of the input so the UI can pair rates with the submitted code without
+    # re-joining on index.
+    procedure_code: Optional[str] = None
+    # Global / no-modifier rates
     non_facility_rate: Optional[Decimal] = None
     facility_rate: Optional[Decimal] = None
+    # Professional (-26) and technical (-TC) components — populated only when
+    # the request's cms_include_pc_tc flag is set. None when the code has no
+    # PC/TC split (E/M, drugs, most labs) or when the lookup failed.
+    professional_rate: Optional[Decimal] = None
+    technical_rate: Optional[Decimal] = None
     work_rvu: Optional[Decimal] = None
     pe_rvu: Optional[Decimal] = None
     mp_rvu: Optional[Decimal] = None

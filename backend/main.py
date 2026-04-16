@@ -870,16 +870,22 @@ async def calculator_calculate(
                 )
             warnings.append("APG skipped: no active provider configured.")
         else:
-            # Synthesize a ParsedClaim DTO from the form inputs so we can pipe
-            # it through the existing APG engine unchanged.
+            # The form's "Paid $" input gets stored on billed_amount in the
+            # CalculatorLineIn payload (legacy field name). We flow that value
+            # through to the synthetic ParsedClaim as paid_amount so the APG
+            # engine's variance = correct - paid math is meaningful — which is
+            # what the user actually wants to see in the variance column.
+            paid_total = sum(
+                (Decimal(str(sl.billed_amount or 0)) for sl in payload.service_lines),
+                Decimal("0"),
+            )
             synthetic = ParsedClaimDTO(
                 file_type=FileType.ERA_835I,
                 claim_id=f"CALC-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}",
                 date_of_service=payload.date_of_service,
-                billed_amount=sum(
-                    (Decimal(str(sl.billed_amount or 0)) for sl in payload.service_lines),
-                    Decimal("0"),
-                ),
+                billed_amount=paid_total,   # shown as "Billed total" in UI
+                paid_amount=paid_total,     # drives variance
+                allowed_amount=paid_total,
                 principal_diagnosis=payload.principal_diagnosis,
                 other_diagnoses=list(payload.other_diagnoses),
                 service_lines=[
@@ -889,6 +895,8 @@ async def calculator_calculate(
                         modifiers=[m.strip().upper() for m in (sl.modifiers or []) if m],
                         units=sl.units,
                         billed_amount=Decimal(str(sl.billed_amount)) if sl.billed_amount else Decimal("0"),
+                        paid_amount=Decimal(str(sl.billed_amount)) if sl.billed_amount else Decimal("0"),
+                        allowed_amount=Decimal(str(sl.billed_amount)) if sl.billed_amount else Decimal("0"),
                         date_of_service=payload.date_of_service,
                     )
                     for i, sl in enumerate(payload.service_lines, start=1)
@@ -919,40 +927,71 @@ async def calculator_calculate(
                 )
             warnings.append("CMS skipped: no locality (pass cms_locality or configure provider).")
         else:
+            import asyncio as _asyncio
             cms_locality_used = locality
             cms = get_cms_engine()
-            cms_lines = []
-            for sl in payload.service_lines:
+            year = payload.date_of_service.year
+
+            async def _one_line(sl) -> CalculatorLineCMS:
                 code = sl.procedure_code.upper().strip()
                 modifier = (sl.modifiers[0].upper().strip() if sl.modifiers else "")
-                try:
-                    row = await cms.get_mpfs_rate(
-                        session, code, modifier, locality,
-                        payload.date_of_service.year,
-                    )
-                except Exception as e:  # live HTTP, CMS outages, etc.
-                    cms_lines.append(CalculatorLineCMS(error=f"CMS API error: {e}"))
-                    continue
+                # Always fetch the base (user-supplied-modifier) rate
+                base_task = cms.get_mpfs_rate(session, code, modifier, locality, year)
+
+                # Optionally fetch the -26 (professional) and -TC (technical) rows
+                # in parallel. Not every HCPCS code has a PC/TC split — for E/M,
+                # drugs, most labs, those queries return None and we render '—'.
+                if payload.cms_include_pc_tc:
+                    pro_task = cms.get_mpfs_rate(session, code, "26", locality, year)
+                    tec_task = cms.get_mpfs_rate(session, code, "TC", locality, year)
+                    try:
+                        row, pro_row, tec_row = await _asyncio.gather(
+                            base_task, pro_task, tec_task, return_exceptions=False,
+                        )
+                    except Exception as e:
+                        return CalculatorLineCMS(procedure_code=code, error=f"CMS API error: {e}")
+                else:
+                    try:
+                        row = await base_task
+                    except Exception as e:
+                        return CalculatorLineCMS(procedure_code=code, error=f"CMS API error: {e}")
+                    pro_row = tec_row = None
+
                 if row is None:
-                    cms_lines.append(CalculatorLineCMS(
+                    return CalculatorLineCMS(
+                        procedure_code=code,
                         error=f"No MPFS rate for HCPCS {code} "
                               f"(modifier {modifier or 'none'}, locality {locality}, "
-                              f"year {payload.date_of_service.year})",
-                    ))
-                    continue
+                              f"year {year})",
+                    )
                 chosen = row.facility_rate if payload.cms_use_facility_rate else row.non_facility_rate
-                # Apply units: MPFS is per-unit
                 expected = (chosen * sl.units) if chosen is not None else None
-                cms_lines.append(CalculatorLineCMS(
+
+                # PC/TC rates: each of pro_row / tec_row has its own non-facility
+                # rate. We surface the non-facility side as 'the' professional or
+                # technical rate (facility/non-facility distinction rarely applies
+                # on the PC row). None values naturally pass through.
+                pro_rate = pro_row.non_facility_rate if pro_row is not None else None
+                tec_rate = tec_row.non_facility_rate if tec_row is not None else None
+
+                return CalculatorLineCMS(
+                    procedure_code=code,
                     non_facility_rate=row.non_facility_rate,
                     facility_rate=row.facility_rate,
+                    professional_rate=pro_rate,
+                    technical_rate=tec_rate,
                     work_rvu=row.work_rvu,
                     pe_rvu=row.pe_rvu,
                     mp_rvu=row.mp_rvu,
                     total_rvu=row.total_rvu,
                     conversion_factor=row.conversion_factor,
                     expected_payment=expected,
-                ))
+                )
+
+            # Process lines in parallel across the top level too, not just
+            # within a single line's PC/TC fetches. Semaphore in CMSFeeScheduleEngine
+            # caps total concurrent outbound HTTP requests to 10.
+            cms_lines = list(await _asyncio.gather(*[_one_line(sl) for sl in payload.service_lines]))
 
     return CalculatorOut(
         date_of_service=payload.date_of_service,

@@ -2,15 +2,16 @@ import { useState } from 'react';
 import { useMutation } from '@tanstack/react-query';
 import {
   Calculator as CalcIcon, Plus, Trash2, Play,
-  AlertCircle, CheckCircle2, Info,
+  AlertCircle, Info,
 } from 'lucide-react';
 import { calculateRate, extractErrorMessage } from '../services/api.js';
 import { fmtCurrency, fmtPercent, varianceSign } from '../utils/format.js';
 
-// Manual CPT/ICD entry calculator.
-// Lets a user — after setting up their provider — type in one or more
-// service lines and get both the expected Article 28 APG reimbursement and
-// the expected Medicare MPFS payment side by side.
+// Manual CPT/ICD entry calculator with full math-chain transparency.
+// Each APG line shows: EAPG assignment → weight → base rate → modifiers →
+// final rounded payment, so a billing analyst can audit exactly how the
+// number was arrived at. CMS side shows per-line non-facility / facility /
+// (optional) professional / (optional) technical rates plus all RVUs.
 
 const TODAY = new Date().toISOString().slice(0, 10);
 
@@ -18,7 +19,7 @@ const EMPTY_LINE = {
   procedure_code: '',
   modifiers: ['', '', '', ''],
   units: 1,
-  billed_amount: '',
+  billed_amount: '',   // semantically "paid", but keeps the API field name
 };
 
 export default function Calculator() {
@@ -28,14 +29,14 @@ export default function Calculator() {
   const [target, setTarget] = useState('both');
   const [cmsLocality, setCmsLocality] = useState('');
   const [useFacilityRate, setUseFacilityRate] = useState(false);
-  const [lines, setLines] = useState([{ ...EMPTY_LINE }]);
+  const [includePcTc, setIncludePcTc] = useState(false);
+  const [lines, setLines] = useState([{ ...EMPTY_LINE, modifiers: ['', '', '', ''] }]);
 
   const mut = useMutation({ mutationFn: calculateRate });
 
   function updateLine(idx, patch) {
     setLines((prev) => prev.map((l, i) => (i === idx ? { ...l, ...patch } : l)));
   }
-
   function updateModifier(lineIdx, modIdx, value) {
     setLines((prev) =>
       prev.map((l, i) => {
@@ -46,11 +47,9 @@ export default function Calculator() {
       })
     );
   }
-
   function addLine() {
     setLines((prev) => [...prev, { ...EMPTY_LINE, modifiers: ['', '', '', ''] }]);
   }
-
   function removeLine(idx) {
     setLines((prev) => (prev.length <= 1 ? prev : prev.filter((_, i) => i !== idx)));
   }
@@ -74,6 +73,7 @@ export default function Calculator() {
     };
     if (cmsLocality.trim()) payload.cms_locality = cmsLocality.trim();
     if (useFacilityRate) payload.cms_use_facility_rate = true;
+    if (includePcTc) payload.cms_include_pc_tc = true;
     mut.mutate(payload);
   }
 
@@ -87,7 +87,8 @@ export default function Calculator() {
           <h1 className="text-xl font-semibold text-brand-900">Rate Calculator</h1>
           <p className="text-sm text-slate-500">
             Enter CPT/HCPCS + ICD-10 codes to see the expected APG (Article 28) and
-            CMS MPFS (Medicare professional) rates for a date of service.
+            CMS MPFS (Medicare professional) rates for a date of service, with the
+            full calculation broken down so you can audit every number.
           </p>
         </div>
       </header>
@@ -130,7 +131,7 @@ export default function Calculator() {
           </div>
         </div>
 
-        {/* CMS-specific row — only visible when CMS is part of target */}
+        {/* CMS-specific row */}
         {(target === 'cms' || target === 'both') && (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 border-t border-slate-200 pt-4">
             <div>
@@ -141,11 +142,11 @@ export default function Calculator() {
                 value={cmsLocality} onChange={(e) => setCmsLocality(e.target.value)}
               />
               <p className="text-xs text-slate-500 mt-1">
-                e.g. <code>01</code> for NYC. Leave blank to use the provider's default.
+                e.g. <code>01</code> for NYC.
               </p>
             </div>
-            <div className="md:col-span-2">
-              <label className="label block">Place of service for MPFS</label>
+            <div className="md:col-span-2 space-y-2">
+              <label className="label block">CMS options</label>
               <label className="inline-flex items-center gap-2 text-sm">
                 <input
                   type="checkbox"
@@ -153,7 +154,17 @@ export default function Calculator() {
                   checked={useFacilityRate}
                   onChange={(e) => setUseFacilityRate(e.target.checked)}
                 />
-                Use facility rate (e.g. hospital outpatient) instead of non-facility (office)
+                Use facility rate (hospital outpatient) instead of non-facility (office)
+              </label>
+              <label className="inline-flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  className="accent-primary"
+                  checked={includePcTc}
+                  onChange={(e) => setIncludePcTc(e.target.checked)}
+                />
+                Show professional (-26) + technical (-TC) component split
+                <span className="text-xs text-slate-400">(adds 2 API calls per line)</span>
               </label>
             </div>
           </div>
@@ -165,10 +176,7 @@ export default function Calculator() {
             <h2 className="text-sm font-semibold text-brand-900 uppercase tracking-wide">
               Service lines ({lines.length})
             </h2>
-            <button
-              type="button" className="btn-secondary"
-              onClick={addLine}
-            >
+            <button type="button" className="btn-secondary" onClick={addLine}>
               <Plus className="w-4 h-4" aria-hidden /> Add line
             </button>
           </div>
@@ -181,7 +189,9 @@ export default function Calculator() {
                   <th className="text-left font-semibold px-3 py-2">CPT / HCPCS *</th>
                   <th className="text-left font-semibold px-3 py-2">Modifiers</th>
                   <th className="text-right font-semibold px-3 py-2 w-20">Units</th>
-                  <th className="text-right font-semibold px-3 py-2 w-32">Billed $</th>
+                  <th className="text-right font-semibold px-3 py-2 w-32">
+                    Paid $ <span className="text-slate-400 normal-case font-normal">(optional)</span>
+                  </th>
                   <th className="w-10"></th>
                 </tr>
               </thead>
@@ -195,9 +205,7 @@ export default function Calculator() {
                         className="input font-mono uppercase" placeholder="99213"
                         maxLength={8}
                         value={line.procedure_code}
-                        onChange={(e) =>
-                          updateLine(i, { procedure_code: e.target.value })
-                        }
+                        onChange={(e) => updateLine(i, { procedure_code: e.target.value })}
                       />
                     </td>
                     <td className="px-3 py-2">
@@ -247,6 +255,11 @@ export default function Calculator() {
               </tbody>
             </table>
           </div>
+          <p className="text-xs text-slate-500 mt-2">
+            <strong>Paid $</strong> is what the payer actually paid you — used only to
+            show variance (correct APG − paid). Leave blank if you just want to see
+            the expected rate.
+          </p>
         </div>
 
         <div className="flex justify-end pt-2 border-t border-slate-200">
@@ -257,7 +270,6 @@ export default function Calculator() {
         </div>
       </form>
 
-      {/* Error */}
       {mut.isError && (
         <div className="card p-4 border-l-4 border-l-danger">
           <span className="pill-danger">
@@ -266,16 +278,15 @@ export default function Calculator() {
         </div>
       )}
 
-      {/* Results */}
-      {mut.isSuccess && <ResultsPanel data={mut.data} target={target} />}
+      {mut.isSuccess && <ResultsPanel data={mut.data} useFacilityRate={useFacilityRate} />}
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Results — APG panel + CMS panel + per-line side-by-side table
+// Results
 // ---------------------------------------------------------------------------
-function ResultsPanel({ data, target }) {
+function ResultsPanel({ data, useFacilityRate }) {
   const { apg, cms_lines, cms_locality_used, warnings } = data;
 
   return (
@@ -292,18 +303,21 @@ function ResultsPanel({ data, target }) {
       )}
 
       {apg && <APGResultCard apg={apg} />}
-
       {cms_lines && (
-        <CMSResultCard cms_lines={cms_lines} cms_locality_used={cms_locality_used} />
+        <CMSResultCard
+          cms_lines={cms_lines}
+          cms_locality_used={cms_locality_used}
+          useFacilityRate={useFacilityRate}
+        />
       )}
-
-      {apg && cms_lines && (
-        <SideBySideCard apg={apg} cms_lines={cms_lines} />
-      )}
+      {apg && cms_lines && <SideBySideCard apg={apg} cms_lines={cms_lines} useFacilityRate={useFacilityRate} />}
     </div>
   );
 }
 
+// ---------------------------------------------------------------------------
+// APG result — provider context + per-line math chain
+// ---------------------------------------------------------------------------
 function APGResultCard({ apg }) {
   const sign = varianceSign(apg.variance);
   const varClass =
@@ -311,27 +325,57 @@ function APGResultCard({ apg }) {
     : sign === 'over' ? 'text-warning-700'
     : 'text-slate-700';
 
+  const totalWeight = apg.line_details.reduce(
+    (acc, ld) => acc + (ld.weight ? parseFloat(ld.weight) : 0), 0,
+  );
+
   return (
-    <div className="card p-5">
-      <div className="flex items-center justify-between mb-4">
+    <div className="card p-5 space-y-5">
+      <div className="flex items-start justify-between flex-wrap gap-3">
         <div>
           <h2 className="text-sm font-semibold text-brand-900 uppercase tracking-wide">
-            APG result — {apg.peer_group} · {apg.region}
+            APG result — Article 28
           </h2>
           <p className="text-xs text-slate-500 mt-0.5">
-            Base rate: {fmtCurrency(apg.base_rate_applied)}
+            Results computed using NYS DOH APG methodology and reference data loaded from
+            the workbook.
           </p>
         </div>
         <div className="flex flex-wrap gap-1">
           {apg.discounting_applied && <span className="pill-warning">Multi-proc discount</span>}
-          {apg.u6_applied && <span className="pill-warning">U6</span>}
+          {apg.u6_applied && <span className="pill-warning">U6 modifier</span>}
           {apg.capital_applied && <span className="pill-brand">Capital add-on</span>}
         </div>
       </div>
 
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+      {/* Provider context block — the inputs that drove the calculation */}
+      <section className="bg-slate-50 rounded-md p-4 text-sm">
+        <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">
+          Factors used in this calculation
+        </div>
+        <dl className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <Factor label="Peer group" value={apg.peer_group} />
+          <Factor label="Region" value={apg.region} />
+          <Factor label="Base rate" value={fmtCurrency(apg.base_rate_applied)} strong />
+          <Factor label="Total weight (paid lines)" value={totalWeight.toFixed(4)} />
+          <Factor label="Multi-proc discount" value={apg.discounting_applied ? 'Yes (50% on secondary)' : 'No'} />
+          <Factor label="U6 modifier" value={apg.u6_applied ? 'Yes' : 'No'} />
+          <Factor label="Capital add-on" value={
+            apg.capital_applied
+              ? fmtCurrency(apg.capital_addon_amount || 0)
+              : 'Not eligible'} />
+          <Factor label="Rounding" value="Half-up, 2dp" />
+        </dl>
+        <p className="text-xs text-slate-500 mt-3">
+          Formula per line: <code>Line payment = EAPG weight × base rate × (0.5 if discounted) × (U6 factor if applied) × units</code>.
+          Incidental-type EAPGs and zero-weight codes are <em>packaged</em> (bundled into the primary significant procedure — no separate payment).
+        </p>
+      </section>
+
+      {/* Totals band */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <Stat label="Correct APG payment" value={fmtCurrency(apg.correct_apg_payment)} strong />
-        <Stat label="Billed total" value={fmtCurrency(apg.actual_paid)} />
+        <Stat label="Paid total" value={fmtCurrency(apg.actual_paid)} />
         <div>
           <div className="kpi-label">Variance</div>
           <div className={`kpi-value ${varClass}`}>{fmtCurrency(apg.variance)}</div>
@@ -342,101 +386,249 @@ function APGResultCard({ apg }) {
         </div>
       </div>
 
-      <table className="w-full text-sm">
-        <thead className="bg-slate-50 text-slate-600 text-xs uppercase tracking-wide">
-          <tr>
-            <th className="text-left px-3 py-2 font-semibold w-8">#</th>
-            <th className="text-left px-3 py-2 font-semibold">Proc</th>
-            <th className="text-left px-3 py-2 font-semibold">EAPG</th>
-            <th className="text-left px-3 py-2 font-semibold">Type</th>
-            <th className="text-right px-3 py-2 font-semibold">Weight</th>
-            <th className="text-right px-3 py-2 font-semibold">Expected</th>
-            <th className="text-left px-3 py-2 font-semibold">Flags</th>
-          </tr>
-        </thead>
-        <tbody className="divide-y divide-slate-100">
-          {apg.line_details.map((ld) => (
-            <tr key={ld.line_seq}>
-              <td className="px-3 py-2 text-xs font-mono text-slate-400">{ld.line_seq}</td>
-              <td className="px-3 py-2 font-mono text-xs">{ld.procedure_code}</td>
-              <td className="px-3 py-2 text-xs">
-                {ld.eapg ? `${ld.eapg} — ${ld.eapg_desc || ''}` : <span className="text-slate-400">—</span>}
-              </td>
-              <td className="px-3 py-2 text-xs text-slate-600">{ld.eapg_type || '—'}</td>
-              <td className="px-3 py-2 text-right tabular-nums text-xs">
-                {ld.weight !== null && ld.weight !== undefined
-                  ? Number(ld.weight).toFixed(4)
-                  : '—'}
-              </td>
-              <td className="px-3 py-2 text-right tabular-nums">{fmtCurrency(ld.expected_payment)}</td>
-              <td className="px-3 py-2 text-xs text-slate-500">
-                <div className="flex flex-wrap gap-1">
-                  {ld.packaged && <span className="pill-slate">Packaged</span>}
-                  {ld.discounted && <span className="pill-warning">50%</span>}
-                  {ld.u6_applied && <span className="pill-warning">U6</span>}
-                  {ld.denied && <span className="pill-danger">Denied</span>}
-                </div>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      {/* Per-line math chain */}
+      <div>
+        <h3 className="text-xs uppercase tracking-wide text-slate-500 mb-2">
+          Per-line math
+        </h3>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50 text-slate-600 text-xs uppercase tracking-wide">
+              <tr>
+                <th className="text-left px-3 py-2 font-semibold w-8">#</th>
+                <th className="text-left px-3 py-2 font-semibold">Proc · EAPG</th>
+                <th className="text-left px-3 py-2 font-semibold">Calculation</th>
+                <th className="text-right px-3 py-2 font-semibold">Expected</th>
+                <th className="text-right px-3 py-2 font-semibold">Paid</th>
+                <th className="text-right px-3 py-2 font-semibold">Variance</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {apg.line_details.map((ld) => (
+                <APGLineRow key={ld.line_seq} ld={ld} baseRate={apg.base_rate_applied} />
+              ))}
+              {/* Capital add-on row, if applied */}
+              {apg.capital_applied && (
+                <tr className="bg-brand-50/30">
+                  <td className="px-3 py-2"></td>
+                  <td className="px-3 py-2 text-xs font-semibold text-brand-900">Capital add-on</td>
+                  <td className="px-3 py-2 text-xs text-slate-500">Per-provider flat amount added to claim total</td>
+                  <td className="px-3 py-2 text-right tabular-nums font-semibold">
+                    {fmtCurrency(apg.capital_addon_amount || 0)}
+                  </td>
+                  <td></td><td></td>
+                </tr>
+              )}
+              {/* Totals row */}
+              <tr className="bg-slate-100 font-semibold">
+                <td className="px-3 py-2"></td>
+                <td className="px-3 py-2 text-xs uppercase tracking-wide">Totals</td>
+                <td className="px-3 py-2"></td>
+                <td className="px-3 py-2 text-right tabular-nums">{fmtCurrency(apg.correct_apg_payment)}</td>
+                <td className="px-3 py-2 text-right tabular-nums">{fmtCurrency(apg.actual_paid)}</td>
+                <td className={`px-3 py-2 text-right tabular-nums ${varClass}`}>
+                  {fmtCurrency(apg.variance)}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   );
 }
 
-function CMSResultCard({ cms_lines, cms_locality_used }) {
+function APGLineRow({ ld, baseRate }) {
+  // Build the human-readable calculation string, e.g.:
+  //   "2.4000 × $169.02 × 1 unit = $405.65"
+  //   "Packaged — Incidental EAPG"
+  //   "2.4000 × $169.02 × 50% (secondary) = $202.82"
+  const weight = ld.weight !== null && ld.weight !== undefined
+    ? Number(ld.weight) : null;
+  const expected = parseFloat(ld.expected_payment || 0);
+  const paid = parseFloat(ld.actual_paid || 0);
+  const variance = expected - paid;
+  const varClass = variance > 0 ? 'text-danger-700'
+                 : variance < 0 ? 'text-warning-700' : 'text-slate-700';
+
+  let calcParts = [];
+  if (ld.packaged || expected === 0) {
+    if (ld.packaged) {
+      calcParts.push(<em key="pkg">Packaged — no separate payment.</em>);
+    } else if (weight === 0) {
+      calcParts.push(<em key="zw">Weight 0 for this DOS — not separately payable.</em>);
+    } else {
+      calcParts.push(<em key="noeapg">No EAPG match — cannot price.</em>);
+    }
+  } else if (weight !== null) {
+    const parts = [];
+    parts.push(<span key="w" className="font-mono">{weight.toFixed(4)}</span>);
+    parts.push(<span key="mul1"> × </span>);
+    parts.push(<span key="br" className="font-mono">{fmtCurrency(baseRate)}</span>);
+    if (ld.discounted) {
+      parts.push(<span key="mul2"> × </span>);
+      parts.push(<span key="disc" className="font-mono text-warning-700">50%</span>);
+    }
+    if (ld.u6_applied) {
+      parts.push(<span key="mul3"> × </span>);
+      parts.push(<span key="u6" className="font-mono text-warning-700">U6 factor</span>);
+    }
+    parts.push(<span key="eq"> = </span>);
+    parts.push(<span key="ans" className="font-semibold">{fmtCurrency(expected)}</span>);
+    calcParts = parts;
+  }
+
   return (
-    <div className="card p-5">
-      <h2 className="text-sm font-semibold text-brand-900 uppercase tracking-wide mb-3">
-        CMS MPFS result — locality {cms_locality_used}
-      </h2>
-      <table className="w-full text-sm">
-        <thead className="bg-slate-50 text-slate-600 text-xs uppercase tracking-wide">
-          <tr>
-            <th className="text-left px-3 py-2 font-semibold w-8">#</th>
-            <th className="text-right px-3 py-2 font-semibold">Non-facility</th>
-            <th className="text-right px-3 py-2 font-semibold">Facility</th>
-            <th className="text-right px-3 py-2 font-semibold">Work RVU</th>
-            <th className="text-right px-3 py-2 font-semibold">PE RVU</th>
-            <th className="text-right px-3 py-2 font-semibold">MP RVU</th>
-            <th className="text-right px-3 py-2 font-semibold">Total RVU</th>
-            <th className="text-right px-3 py-2 font-semibold">Expected</th>
-          </tr>
-        </thead>
-        <tbody className="divide-y divide-slate-100">
-          {cms_lines.map((l, i) => l.error ? (
-            <tr key={i}>
-              <td className="px-3 py-2 text-xs font-mono text-slate-400">{i + 1}</td>
-              <td colSpan={7} className="px-3 py-2 text-xs text-danger-700">
-                <AlertCircle className="inline w-3 h-3 mr-1" aria-hidden /> {l.error}
-              </td>
+    <tr>
+      <td className="px-3 py-2 text-xs font-mono text-slate-400">{ld.line_seq}</td>
+      <td className="px-3 py-2 text-xs">
+        <div className="font-mono">{ld.procedure_code}</div>
+        <div className="text-slate-500 text-[11px] mt-0.5">
+          {ld.eapg ? `EAPG ${ld.eapg} · ${ld.eapg_type || ''}` : <span className="text-slate-400">no EAPG match</span>}
+        </div>
+        {ld.eapg_desc && (
+          <div className="text-slate-400 text-[11px] italic">{ld.eapg_desc}</div>
+        )}
+      </td>
+      <td className="px-3 py-2 text-xs text-slate-700">
+        {calcParts}
+        {/* Engine notes (packaging reasons, etc.) */}
+        {ld.notes?.length > 0 && (
+          <ul className="mt-1 space-y-0.5 text-[11px] text-slate-500 list-disc pl-4">
+            {ld.notes.map((n, i) => <li key={i}>{n}</li>)}
+          </ul>
+        )}
+        {(ld.modifiers || []).length > 0 && (
+          <div className="mt-1 text-[11px] text-slate-500">
+            Modifiers: <span className="font-mono">{ld.modifiers.join(', ')}</span>
+          </div>
+        )}
+      </td>
+      <td className="px-3 py-2 text-right tabular-nums">{fmtCurrency(expected)}</td>
+      <td className="px-3 py-2 text-right tabular-nums">{fmtCurrency(paid)}</td>
+      <td className={`px-3 py-2 text-right tabular-nums ${varClass}`}>
+        {paid > 0 ? fmtCurrency(variance) : <span className="text-slate-400">—</span>}
+      </td>
+    </tr>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CMS result — per-line 4-column rate grid + RVUs + conversion factor
+// ---------------------------------------------------------------------------
+function CMSResultCard({ cms_lines, cms_locality_used, useFacilityRate }) {
+  // Show the conversion factor from the first non-error line (constant per year/locality)
+  const firstRate = cms_lines.find((l) => !l.error);
+  const cf = firstRate?.conversion_factor;
+
+  // Hide PC/TC columns entirely if no line has them populated (the user didn't
+  // opt in, or none of their codes have a PC/TC split)
+  const anyPcTc = cms_lines.some((l) => l.professional_rate != null || l.technical_rate != null);
+
+  return (
+    <div className="card p-5 space-y-4">
+      <div>
+        <h2 className="text-sm font-semibold text-brand-900 uppercase tracking-wide">
+          CMS MPFS result — Medicare professional
+        </h2>
+        <p className="text-xs text-slate-500 mt-0.5">
+          Rates from the CMS data.cms.gov Physician Fee Schedule dataset.
+          Cached locally for 24h per (HCPCS, modifier, locality, year).
+        </p>
+      </div>
+
+      <section className="bg-slate-50 rounded-md p-4 text-sm">
+        <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">
+          Factors used in this calculation
+        </div>
+        <dl className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <Factor label="Locality" value={cms_locality_used || '—'} strong />
+          <Factor label="Place of service" value={useFacilityRate ? 'Facility' : 'Non-facility'} />
+          <Factor label="Conversion factor (CF)" value={cf ? fmtCurrency(cf) : '—'} />
+          <Factor label="Expected per line" value={useFacilityRate ? 'Facility rate × units' : 'Non-facility rate × units'} />
+        </dl>
+        <p className="text-xs text-slate-500 mt-3">
+          Formula: <code>Payment = (Work RVU + PE RVU + MP RVU) × GPCI factors × CF × units</code>.
+          CMS returns the computed total rate; the RVU columns below show the breakdown for audit.
+          {anyPcTc && <> Professional (-26) and technical (-TC) columns show the PC/TC split where applicable.</>}
+        </p>
+      </section>
+
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-slate-600 text-xs uppercase tracking-wide">
+            <tr>
+              <th className="text-left px-3 py-2 font-semibold w-8">#</th>
+              <th className="text-left px-3 py-2 font-semibold">Proc</th>
+              <th className="text-right px-3 py-2 font-semibold">Non-facility</th>
+              <th className="text-right px-3 py-2 font-semibold">Facility</th>
+              {anyPcTc && <th className="text-right px-3 py-2 font-semibold">Professional</th>}
+              {anyPcTc && <th className="text-right px-3 py-2 font-semibold">Technical</th>}
+              <th className="text-right px-3 py-2 font-semibold">Work</th>
+              <th className="text-right px-3 py-2 font-semibold">PE</th>
+              <th className="text-right px-3 py-2 font-semibold">MP</th>
+              <th className="text-right px-3 py-2 font-semibold">Total RVU</th>
+              <th className="text-right px-3 py-2 font-semibold">Expected</th>
             </tr>
-          ) : (
-            <tr key={i}>
-              <td className="px-3 py-2 text-xs font-mono text-slate-400">{i + 1}</td>
-              <td className="px-3 py-2 text-right tabular-nums">{fmtCurrency(l.non_facility_rate)}</td>
-              <td className="px-3 py-2 text-right tabular-nums">{fmtCurrency(l.facility_rate)}</td>
-              <td className="px-3 py-2 text-right tabular-nums text-xs">{fmtRvu(l.work_rvu)}</td>
-              <td className="px-3 py-2 text-right tabular-nums text-xs">{fmtRvu(l.pe_rvu)}</td>
-              <td className="px-3 py-2 text-right tabular-nums text-xs">{fmtRvu(l.mp_rvu)}</td>
-              <td className="px-3 py-2 text-right tabular-nums text-xs">{fmtRvu(l.total_rvu)}</td>
-              <td className="px-3 py-2 text-right tabular-nums font-semibold">
-                {fmtCurrency(l.expected_payment)}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {cms_lines.map((l, i) => l.error ? (
+              <tr key={i}>
+                <td className="px-3 py-2 text-xs font-mono text-slate-400">{i + 1}</td>
+                <td colSpan={anyPcTc ? 10 : 8} className="px-3 py-2 text-xs text-danger-700">
+                  <AlertCircle className="inline w-3 h-3 mr-1" aria-hidden /> {l.error}
+                </td>
+              </tr>
+            ) : (
+              <tr key={i}>
+                <td className="px-3 py-2 text-xs font-mono text-slate-400">{i + 1}</td>
+                <td className="px-3 py-2 text-xs font-mono">{l.procedure_code || '—'}</td>
+                <td className={`px-3 py-2 text-right tabular-nums ${!useFacilityRate ? 'font-semibold' : ''}`}>
+                  {fmtCurrency(l.non_facility_rate)}
+                </td>
+                <td className={`px-3 py-2 text-right tabular-nums ${useFacilityRate ? 'font-semibold' : ''}`}>
+                  {fmtCurrency(l.facility_rate)}
+                </td>
+                {anyPcTc && (
+                  <td className="px-3 py-2 text-right tabular-nums">
+                    {l.professional_rate != null ? fmtCurrency(l.professional_rate) : <span className="text-slate-300">—</span>}
+                  </td>
+                )}
+                {anyPcTc && (
+                  <td className="px-3 py-2 text-right tabular-nums">
+                    {l.technical_rate != null ? fmtCurrency(l.technical_rate) : <span className="text-slate-300">—</span>}
+                  </td>
+                )}
+                <td className="px-3 py-2 text-right tabular-nums text-xs">{fmtRvu(l.work_rvu)}</td>
+                <td className="px-3 py-2 text-right tabular-nums text-xs">{fmtRvu(l.pe_rvu)}</td>
+                <td className="px-3 py-2 text-right tabular-nums text-xs">{fmtRvu(l.mp_rvu)}</td>
+                <td className="px-3 py-2 text-right tabular-nums text-xs">{fmtRvu(l.total_rvu)}</td>
+                <td className="px-3 py-2 text-right tabular-nums font-semibold">
+                  {fmtCurrency(l.expected_payment)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {!anyPcTc && (
+        <p className="text-xs text-slate-500">
+          Tip: enable the <strong>professional (-26) + technical (-TC)</strong> checkbox above
+          to see the PC/TC component split for codes that have one (typically radiology, pathology, some cardio).
+        </p>
+      )}
     </div>
   );
 }
 
-function SideBySideCard({ apg, cms_lines }) {
+// ---------------------------------------------------------------------------
+// Side-by-side comparison
+// ---------------------------------------------------------------------------
+function SideBySideCard({ apg, cms_lines, useFacilityRate }) {
   return (
     <div className="card p-5">
       <h2 className="text-sm font-semibold text-brand-900 uppercase tracking-wide mb-3">
-        Side-by-side comparison
+        APG vs CMS — side by side
       </h2>
       <table className="w-full text-sm">
         <thead className="bg-slate-50 text-slate-600 text-xs uppercase tracking-wide">
@@ -444,7 +636,12 @@ function SideBySideCard({ apg, cms_lines }) {
             <th className="text-left px-3 py-2 font-semibold w-8">#</th>
             <th className="text-left px-3 py-2 font-semibold">Proc</th>
             <th className="text-right px-3 py-2 font-semibold">APG expected</th>
-            <th className="text-right px-3 py-2 font-semibold">CMS expected</th>
+            <th className="text-right px-3 py-2 font-semibold">
+              CMS expected
+              <div className="font-normal text-[10px] text-slate-400">
+                ({useFacilityRate ? 'facility' : 'non-facility'})
+              </div>
+            </th>
             <th className="text-right px-3 py-2 font-semibold">Difference</th>
           </tr>
         </thead>
@@ -478,12 +675,15 @@ function SideBySideCard({ apg, cms_lines }) {
         </tbody>
       </table>
       <p className="text-xs text-slate-500 mt-3">
-        Difference = APG expected − CMS expected. Positive means the APG rate is higher; negative means CMS is higher.
+        Difference = APG expected − CMS expected. Positive: APG pays more than Medicare for this service. Negative: Medicare pays more.
       </p>
     </div>
   );
 }
 
+// ---------------------------------------------------------------------------
+// Primitives
+// ---------------------------------------------------------------------------
 function Stat({ label, value, strong = false }) {
   return (
     <div>
@@ -491,6 +691,17 @@ function Stat({ label, value, strong = false }) {
       <div className={strong ? 'kpi-value' : 'text-lg font-semibold text-slate-700 tabular-nums'}>
         {value}
       </div>
+    </div>
+  );
+}
+
+function Factor({ label, value, strong = false }) {
+  return (
+    <div>
+      <dt className="text-[11px] uppercase tracking-wide text-slate-500">{label}</dt>
+      <dd className={strong ? 'text-sm font-semibold text-brand-900 tabular-nums' : 'text-sm text-slate-700 tabular-nums'}>
+        {value || '—'}
+      </dd>
     </div>
   );
 }
