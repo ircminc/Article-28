@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from 'react-router-dom';
 import Layout from './components/Layout.jsx';
 import Dashboard from './pages/Dashboard.jsx';
 import Upload from './pages/Upload.jsx';
+import Calculator from './pages/Calculator.jsx';
 import Claims from './pages/Claims.jsx';
 import ClaimDetail from './pages/ClaimDetail.jsx';
 import Reports from './pages/Reports.jsx';
@@ -30,6 +31,7 @@ export default function App() {
           <Route index element={<Navigate to="/dashboard" replace />} />
           <Route path="dashboard" element={<Dashboard />} />
           <Route path="upload" element={<Upload />} />
+          <Route path="calculator" element={<Calculator />} />
           <Route path="claims" element={<Claims />} />
           <Route path="claims/:id" element={<ClaimDetail />} />
           <Route path="reports" element={<Reports />} />

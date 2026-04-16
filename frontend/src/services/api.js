@@ -72,6 +72,21 @@ export async function clearAllClaims() {
   return data;
 }
 
+// Manual Rate Calculator — POST payload shape:
+//   {
+//     date_of_service: 'YYYY-MM-DD',
+//     service_lines: [{ procedure_code, modifiers: [], units, billed_amount }, ...],
+//     principal_diagnosis: 'E119',
+//     other_diagnoses: ['I10', ...],
+//     target: 'apg' | 'cms' | 'both',
+//     cms_locality: '01',        // optional; falls back to provider config
+//     cms_use_facility_rate: false,
+//   }
+export async function calculateRate(payload) {
+  const { data } = await apiClient.post('/api/calculator/calculate', payload);
+  return data;
+}
+
 // ---------------------------------------------------------------------------
 // Uploads
 // ---------------------------------------------------------------------------

@@ -69,13 +69,20 @@ from backend.exporters.pdf_exporter import PDFExporter
 from backend.models.schemas import (
     APGResult as APGResultOut,
     BaseRateLookupOut,
+    CalculationTarget,
+    CalculatorIn,
+    CalculatorLineCMS,
+    CalculatorOut,
     ExportOptions,
     HcpcsLookupOut,
     Icd10LookupOut,
     ApgWeightLookupOut,
+    ParsedClaim as ParsedClaimDTO,
     ProviderConfigIn,
     ProviderConfigOut,
     Region,
+    ServiceLine as ServiceLineDTO,
+    FileType,
 )
 from backend.parsers.edi_835i import parse_835i
 from backend.parsers.edi_835p import parse_835p
@@ -823,6 +830,138 @@ async def lookup_zip_locality(
             "--file <path>` to load the CMS ZIP5 file.",
         )
     return {"zip_code": cms.normalize_zip(zip_code), "locality": locality}
+
+
+# ---------------------------------------------------------------------------
+# Rate Calculator (Phase 8) — manual CPT/ICD entry
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/calculator/calculate", response_model=CalculatorOut)
+async def calculator_calculate(
+    payload: CalculatorIn,
+    current: CurrentUser,
+    session: AsyncSession = Depends(get_session),
+) -> CalculatorOut:
+    """Compute APG and/or CMS MPFS rates for manually-entered service lines.
+
+    Reuses the same APGEngine and CMSFeeScheduleEngine as the EDI upload path,
+    so results match the batch-processing flow exactly.
+
+    Requires an active provider configuration when the target includes 'apg'.
+    Requires a CMS locality (either on the payload or the active provider) when
+    the target includes 'cms'.
+    """
+    warnings: list[str] = []
+
+    # ------------------------------ APG ------------------------------------
+    apg_result = None
+    if payload.target in (CalculationTarget.APG, CalculationTarget.BOTH):
+        q = await session.execute(
+            select(ProviderConfig).where(ProviderConfig.is_active.is_(True)).limit(1)
+        )
+        provider = q.scalar_one_or_none()
+        if provider is None:
+            if payload.target == CalculationTarget.APG:
+                raise HTTPException(
+                    400,
+                    "APG calculation requires an active provider. "
+                    "Set one via Settings before using the calculator.",
+                )
+            warnings.append("APG skipped: no active provider configured.")
+        else:
+            # Synthesize a ParsedClaim DTO from the form inputs so we can pipe
+            # it through the existing APG engine unchanged.
+            synthetic = ParsedClaimDTO(
+                file_type=FileType.ERA_835I,
+                claim_id=f"CALC-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}",
+                date_of_service=payload.date_of_service,
+                billed_amount=sum(
+                    (Decimal(str(sl.billed_amount or 0)) for sl in payload.service_lines),
+                    Decimal("0"),
+                ),
+                principal_diagnosis=payload.principal_diagnosis,
+                other_diagnoses=list(payload.other_diagnoses),
+                service_lines=[
+                    ServiceLineDTO(
+                        line_seq=i,
+                        procedure_code=sl.procedure_code.upper().strip(),
+                        modifiers=[m.strip().upper() for m in (sl.modifiers or []) if m],
+                        units=sl.units,
+                        billed_amount=Decimal(str(sl.billed_amount)) if sl.billed_amount else Decimal("0"),
+                        date_of_service=payload.date_of_service,
+                    )
+                    for i, sl in enumerate(payload.service_lines, start=1)
+                ],
+            )
+            apg_engine = APGEngine()
+            apg_result = await apg_engine.calculate(session, synthetic, provider)
+
+    # ------------------------------ CMS ------------------------------------
+    cms_lines = None
+    cms_locality_used = None
+    if payload.target in (CalculationTarget.CMS, CalculationTarget.BOTH):
+        # Locality resolution order: form → active provider → fail
+        locality = payload.cms_locality
+        if not locality:
+            q = await session.execute(
+                select(ProviderConfig).where(ProviderConfig.is_active.is_(True)).limit(1)
+            )
+            prov = q.scalar_one_or_none()
+            if prov and prov.cms_locality:
+                locality = prov.cms_locality
+        if not locality:
+            if payload.target == CalculationTarget.CMS:
+                raise HTTPException(
+                    400,
+                    "CMS calculation requires a locality. Either pass cms_locality "
+                    "or set one on the active provider.",
+                )
+            warnings.append("CMS skipped: no locality (pass cms_locality or configure provider).")
+        else:
+            cms_locality_used = locality
+            cms = get_cms_engine()
+            cms_lines = []
+            for sl in payload.service_lines:
+                code = sl.procedure_code.upper().strip()
+                modifier = (sl.modifiers[0].upper().strip() if sl.modifiers else "")
+                try:
+                    row = await cms.get_mpfs_rate(
+                        session, code, modifier, locality,
+                        payload.date_of_service.year,
+                    )
+                except Exception as e:  # live HTTP, CMS outages, etc.
+                    cms_lines.append(CalculatorLineCMS(error=f"CMS API error: {e}"))
+                    continue
+                if row is None:
+                    cms_lines.append(CalculatorLineCMS(
+                        error=f"No MPFS rate for HCPCS {code} "
+                              f"(modifier {modifier or 'none'}, locality {locality}, "
+                              f"year {payload.date_of_service.year})",
+                    ))
+                    continue
+                chosen = row.facility_rate if payload.cms_use_facility_rate else row.non_facility_rate
+                # Apply units: MPFS is per-unit
+                expected = (chosen * sl.units) if chosen is not None else None
+                cms_lines.append(CalculatorLineCMS(
+                    non_facility_rate=row.non_facility_rate,
+                    facility_rate=row.facility_rate,
+                    work_rvu=row.work_rvu,
+                    pe_rvu=row.pe_rvu,
+                    mp_rvu=row.mp_rvu,
+                    total_rvu=row.total_rvu,
+                    conversion_factor=row.conversion_factor,
+                    expected_payment=expected,
+                ))
+
+    return CalculatorOut(
+        date_of_service=payload.date_of_service,
+        target=payload.target,
+        apg=apg_result,
+        cms_locality_used=cms_locality_used,
+        cms_lines=cms_lines,
+        warnings=warnings,
+    )
 
 
 # ---------------------------------------------------------------------------

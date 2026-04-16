@@ -339,3 +339,60 @@ class AdminPasswordResetIn(BaseModel):
 
 # Resolve forward refs (TokenOut.user)
 TokenOut.model_rebuild()
+
+
+# ---------------------------------------------------------------------------
+# Rate Calculator (Phase 8) — manual CPT/ICD entry instead of EDI upload
+# ---------------------------------------------------------------------------
+
+
+class CalculationTarget(str, Enum):
+    APG = "apg"
+    CMS = "cms"
+    BOTH = "both"
+
+
+class CalculatorLineIn(BaseModel):
+    """A single service line typed into the calculator form."""
+    procedure_code: str = Field(..., min_length=1, max_length=12)
+    modifiers: list[str] = Field(default_factory=list, max_length=4)
+    units: int = Field(default=1, ge=1, le=999)
+    billed_amount: Optional[Decimal] = None   # optional; drives the variance column if present
+
+
+class CalculatorIn(BaseModel):
+    """POST body for /api/calculator/calculate."""
+    date_of_service: date
+    service_lines: list[CalculatorLineIn] = Field(..., min_length=1, max_length=50)
+    principal_diagnosis: Optional[str] = None
+    other_diagnoses: list[str] = Field(default_factory=list, max_length=24)
+    target: CalculationTarget = CalculationTarget.BOTH
+    # CMS-specific overrides (otherwise pulled from the active provider config)
+    cms_locality: Optional[str] = None
+    cms_use_facility_rate: bool = False
+
+
+class CalculatorLineCMS(BaseModel):
+    """CMS MPFS result for a single line."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    non_facility_rate: Optional[Decimal] = None
+    facility_rate: Optional[Decimal] = None
+    work_rvu: Optional[Decimal] = None
+    pe_rvu: Optional[Decimal] = None
+    mp_rvu: Optional[Decimal] = None
+    total_rvu: Optional[Decimal] = None
+    conversion_factor: Optional[Decimal] = None
+    expected_payment: Optional[Decimal] = None   # facility or non_facility depending on flag
+    error: Optional[str] = None                  # e.g. "no rate found" / "locality missing"
+
+
+class CalculatorOut(BaseModel):
+    """POST response: the full APG calculation (if requested) plus per-line CMS
+    comparisons (if requested). Either or both may be null depending on target."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    date_of_service: date
+    target: CalculationTarget
+    apg: Optional[APGResult] = None
+    cms_locality_used: Optional[str] = None
+    cms_lines: Optional[list[CalculatorLineCMS]] = None
+    warnings: list[str] = Field(default_factory=list)

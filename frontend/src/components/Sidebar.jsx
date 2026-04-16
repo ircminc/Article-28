@@ -4,6 +4,7 @@ import {
   Upload as UploadIcon,
   FileStack,
   FileText,
+  Calculator as CalcIcon,
   Settings as SettingsIcon,
   Users as UsersIcon,
   Stethoscope,
@@ -11,11 +12,12 @@ import {
 import { useAuth } from '../auth/AuthContext.jsx';
 
 const NAV = [
-  { to: '/dashboard', label: 'Dashboard',    icon: LayoutDashboard },
-  { to: '/upload',    label: 'Upload Files', icon: UploadIcon },
-  { to: '/claims',    label: 'Claims',       icon: FileStack },
-  { to: '/reports',   label: 'Reports',      icon: FileText },
-  { to: '/settings',  label: 'Settings',     icon: SettingsIcon },
+  { to: '/dashboard',  label: 'Dashboard',       icon: LayoutDashboard },
+  { to: '/upload',     label: 'Upload Files',    icon: UploadIcon },
+  { to: '/calculator', label: 'Rate Calculator', icon: CalcIcon },
+  { to: '/claims',     label: 'Claims',          icon: FileStack },
+  { to: '/reports',    label: 'Reports',         icon: FileText },
+  { to: '/settings',   label: 'Settings',        icon: SettingsIcon },
 ];
 
 const ADMIN_NAV = [
