@@ -65,6 +65,13 @@ export async function getClaimApg(id) {
   return data;
 }
 
+// Wipes every parsed claim + APG result. Admin or analyst only server-side.
+// Returns { claims_deleted: N } on success.
+export async function clearAllClaims() {
+  const { data } = await apiClient.delete('/api/claims');
+  return data;
+}
+
 // ---------------------------------------------------------------------------
 // Uploads
 // ---------------------------------------------------------------------------

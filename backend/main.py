@@ -37,7 +37,7 @@ from typing import Optional
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend import __version__
@@ -629,6 +629,43 @@ async def get_claim_apg(
         "u6_applied": apg.u6_applied, "capital_applied": apg.capital_applied,
         "line_details": apg.line_details,
     }
+
+
+@app.delete("/api/claims", status_code=200)
+async def clear_all_claims(
+    current: RequireAnalyst,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Wipe every parsed claim and its APG result from the database.
+
+    Analyst or admin only (viewers cannot trigger this). Keeps users, reference
+    data, provider settings, and the audit log. An audit entry records who
+    performed the clear and how many rows were removed.
+
+    Cascade rules on ParsedClaim ensure service_lines, adjustments, and the
+    apg_result row all go when the parent claim is deleted — so we only issue
+    a single `DELETE FROM parsed_claim`. The three child tables also get
+    explicit deletes as a safety net in case any orphan rows ever exist.
+    """
+    # Count first (for the audit log + response)
+    n = (await session.execute(select(func.count()).select_from(ORMClaim))).scalar_one()
+
+    # Delete child tables first in case any orphans exist (belt + suspenders
+    # on top of the ON DELETE CASCADE already on the foreign keys)
+    await session.execute(delete(ORMApgResult))
+    await session.execute(delete(ORMClaimAdjustment))
+    await session.execute(delete(ORMLine))
+    await session.execute(delete(ORMClaim))
+
+    await audit(
+        session, user=current, request=request,
+        action="claims.clear_all",
+        resource=f"{n} claim(s)",
+        details={"claims_deleted": n},
+    )
+    await session.commit()
+    return {"claims_deleted": n}
 
 
 # ---------------------------------------------------------------------------

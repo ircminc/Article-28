@@ -1,7 +1,13 @@
 import { useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Save, AlertCircle, CheckCircle2 } from 'lucide-react';
-import { extractErrorMessage, getProvider, upsertProvider } from '../services/api.js';
+import { Save, AlertCircle, CheckCircle2, Trash2 } from 'lucide-react';
+import {
+  clearAllClaims,
+  extractErrorMessage,
+  getProvider,
+  upsertProvider,
+} from '../services/api.js';
+import { useAuth } from '../auth/AuthContext.jsx';
 
 // Lists mirror the reference-data categorical domains. Keep them in sync with
 // the backend: peer_group values must match rows in apg_base_rates.peer_group,
@@ -69,6 +75,7 @@ const EMPTY = {
 
 export default function Settings() {
   const queryClient = useQueryClient();
+  const { user } = useAuth();
   const { data: existing, isLoading } = useQuery({
     queryKey: ['provider'],
     queryFn: getProvider,
@@ -276,6 +283,78 @@ export default function Settings() {
           </button>
         </div>
       </form>
+
+      {/* Danger zone — admin + analyst only (viewer role is hidden).
+          The button itself still triggers a browser confirm() before firing. */}
+      {user && (user.role === 'admin' || user.role === 'analyst') && (
+        <DangerZone queryClient={queryClient} />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Danger zone — clear all uploaded claims
+// ---------------------------------------------------------------------------
+
+function DangerZone({ queryClient }) {
+  const mutation = useMutation({
+    mutationFn: clearAllClaims,
+    onSuccess: () => {
+      // Invalidate everything that could show claim data
+      queryClient.invalidateQueries({ queryKey: ['claims'] });
+      queryClient.invalidateQueries({ queryKey: ['analytics'] });
+    },
+  });
+
+  function handleClear() {
+    const ok = window.confirm(
+      'This will permanently delete ALL uploaded claims, service lines, ' +
+      'adjustments, and APG results.\n\n' +
+      'Users, settings, and reference data are preserved.\n\n' +
+      'Are you sure you want to continue?'
+    );
+    if (!ok) return;
+    mutation.mutate();
+  }
+
+  return (
+    <div className="card p-6 border-l-4 border-l-danger">
+      <h2 className="text-sm font-semibold text-danger-700 uppercase tracking-wide">
+        Danger zone
+      </h2>
+      <p className="text-sm text-slate-600 mt-2">
+        Delete every uploaded claim, service line, adjustment, and APG result
+        from the database. Useful for clearing out test data. Users, team
+        accounts, reference data (HCPCS / ICD-10 / APG weights / base rates),
+        and the audit log are all preserved. This action is logged to the
+        audit log.
+      </p>
+
+      <div className="mt-4 flex items-center gap-3">
+        <button
+          type="button"
+          className="btn-danger"
+          onClick={handleClear}
+          disabled={mutation.isPending}
+        >
+          <Trash2 className="w-4 h-4" aria-hidden />
+          {mutation.isPending ? 'Clearing…' : 'Clear all uploaded claims'}
+        </button>
+
+        {mutation.isError && (
+          <span className="pill-danger">
+            <AlertCircle className="w-3 h-3" aria-hidden />{' '}
+            {extractErrorMessage(mutation.error)}
+          </span>
+        )}
+        {mutation.isSuccess && (
+          <span className="pill-success">
+            <CheckCircle2 className="w-3 h-3" aria-hidden /> Cleared{' '}
+            {mutation.data?.claims_deleted ?? 0} claim(s).
+          </span>
+        )}
+      </div>
     </div>
   );
 }
