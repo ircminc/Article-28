@@ -83,6 +83,14 @@ export function AuthProvider({ children }) {
 
   async function login(username, password) {
     const { data } = await apiClient.post('/api/auth/login', { username, password });
+    // Attach the new token to the shared axios client SYNCHRONOUSLY, before
+    // React schedules the state update + re-render. This closes a race where
+    // the post-login navigation mounts pages (Dashboard, etc.) whose
+    // useQuery hooks fire API requests BEFORE the useEffect that syncs the
+    // axios header has run — those requests would 401 and bounce the user
+    // back to /login.
+    apiClient.defaults.headers.common.Authorization = `Bearer ${data.access_token}`;
+    localStorage.setItem(STORAGE_KEY, data.access_token);
     setTokenState(data.access_token);
     setUser(data.user);
     return data.user;
@@ -94,6 +102,9 @@ export function AuthProvider({ children }) {
     } catch {
       // Even if the API call fails (expired token, network), clear local state.
     }
+    // Clear side-effects synchronously too (same reasoning as login).
+    delete apiClient.defaults.headers.common.Authorization;
+    localStorage.removeItem(STORAGE_KEY);
     setTokenState(null);
     setUser(null);
   }
