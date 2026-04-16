@@ -3,6 +3,7 @@ import {
   LayoutDashboard,
   Upload as UploadIcon,
   FileStack,
+  FileText,
   Settings as SettingsIcon,
   Stethoscope,
 } from 'lucide-react';
@@ -11,6 +12,7 @@ const NAV = [
   { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { to: '/upload',    label: 'Upload Files', icon: UploadIcon },
   { to: '/claims',    label: 'Claims', icon: FileStack },
+  { to: '/reports',   label: 'Reports', icon: FileText },
   { to: '/settings',  label: 'Settings', icon: SettingsIcon },
 ];
 

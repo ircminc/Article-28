@@ -30,12 +30,13 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -57,12 +58,16 @@ from backend.db.database import (
     engine,
     get_session,
 )
+from backend.engines.analytics_engine import AnalyticsEngine
 from backend.engines.apg_engine import APGEngine
 from backend.engines.claim_linker import link_and_enrich
 from backend.engines.cms_engine import CMSFeeScheduleEngine
+from backend.exporters.excel_exporter import ExcelExporter
+from backend.exporters.pdf_exporter import PDFExporter
 from backend.models.schemas import (
     APGResult as APGResultOut,
     BaseRateLookupOut,
+    ExportOptions,
     HcpcsLookupOut,
     Icd10LookupOut,
     ApgWeightLookupOut,
@@ -722,3 +727,288 @@ async def lookup_zip_locality(
             "--file <path>` to load the CMS ZIP5 file.",
         )
     return {"zip_code": cms.normalize_zip(zip_code), "locality": locality}
+
+
+# ---------------------------------------------------------------------------
+# Analytics (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+_analytics = AnalyticsEngine()
+
+
+def _analytics_filters(date_from, date_to, payer_name, file_type, provider_npi) -> dict:
+    """Collect the query-string filter args into the kwarg dict the engine expects."""
+    return {
+        "date_from": date_from,
+        "date_to": date_to,
+        "payer_name": payer_name,
+        "file_type": file_type,
+        "provider_npi": provider_npi,
+    }
+
+
+@app.get("/api/analytics/summary")
+async def analytics_summary(
+    date_from: Optional[date] = Query(None),
+    date_to: Optional[date] = Query(None),
+    payer_name: Optional[str] = Query(None),
+    file_type: Optional[str] = Query(None, pattern="^(835I|835P|837I|837P)$"),
+    provider_npi: Optional[str] = Query(None),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    return await _analytics.summary(
+        session, **_analytics_filters(date_from, date_to, payer_name, file_type, provider_npi)
+    )
+
+
+@app.get("/api/analytics/compression")
+async def analytics_compression(
+    group_by: str = Query("eapg", pattern="^(eapg|procedure|peer_group|region|date_year)$"),
+    limit: int = Query(20, ge=1, le=200),
+    date_from: Optional[date] = Query(None),
+    date_to: Optional[date] = Query(None),
+    payer_name: Optional[str] = Query(None),
+    file_type: Optional[str] = Query(None, pattern="^(835I|835P|837I|837P)$"),
+    provider_npi: Optional[str] = Query(None),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    return await _analytics.compression(
+        session, group_by=group_by, limit=limit,
+        **_analytics_filters(date_from, date_to, payer_name, file_type, provider_npi),
+    )
+
+
+@app.get("/api/analytics/denials")
+async def analytics_denials(
+    limit: int = Query(20, ge=1, le=200),
+    date_from: Optional[date] = Query(None),
+    date_to: Optional[date] = Query(None),
+    payer_name: Optional[str] = Query(None),
+    file_type: Optional[str] = Query(None, pattern="^(835I|835P|837I|837P)$"),
+    provider_npi: Optional[str] = Query(None),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    return await _analytics.denials(
+        session, limit=limit,
+        **_analytics_filters(date_from, date_to, payer_name, file_type, provider_npi),
+    )
+
+
+@app.get("/api/analytics/trends")
+async def analytics_trends(
+    period: str = Query("monthly", pattern="^(monthly|quarterly)$"),
+    date_from: Optional[date] = Query(None),
+    date_to: Optional[date] = Query(None),
+    payer_name: Optional[str] = Query(None),
+    file_type: Optional[str] = Query(None, pattern="^(835I|835P|837I|837P)$"),
+    provider_npi: Optional[str] = Query(None),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    return await _analytics.trends(
+        session, period=period,
+        **_analytics_filters(date_from, date_to, payer_name, file_type, provider_npi),
+    )
+
+
+@app.get("/api/analytics/payer-scorecard")
+async def analytics_payer_scorecard(
+    date_from: Optional[date] = Query(None),
+    date_to: Optional[date] = Query(None),
+    payer_name: Optional[str] = Query(None),
+    file_type: Optional[str] = Query(None, pattern="^(835I|835P|837I|837P)$"),
+    provider_npi: Optional[str] = Query(None),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    return await _analytics.payer_scorecard(
+        session, **_analytics_filters(date_from, date_to, payer_name, file_type, provider_npi),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Export (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+async def _gather_export_payload(session: AsyncSession, opts: ExportOptions) -> dict:
+    """Assemble the nested dict the Excel/PDF builders consume.
+
+    Kept here (rather than in the exporters) so the exporter modules stay
+    trivial to test with fixtures — no ORM imports required in either.
+    """
+    filters = _analytics_filters(opts.date_from, opts.date_to, opts.payer_name, None, None)
+
+    # Active provider (if any)
+    q = await session.execute(
+        select(ProviderConfig).where(ProviderConfig.is_active.is_(True)).limit(1)
+    )
+    provider = q.scalar_one_or_none()
+    provider_dict = None
+    if provider:
+        provider_dict = {
+            "provider_name": provider.provider_name,
+            "npi": provider.npi,
+            "peer_group": provider.peer_group,
+            "provider_type": provider.provider_type,
+            "region": provider.region,
+            "county_code": provider.county_code,
+            "cms_locality": provider.cms_locality,
+        }
+
+    summary = await _analytics.summary(session, **filters)
+    eapg_breakdown = await _analytics.compression(session, group_by="eapg", limit=50, **filters)
+    denials = await _analytics.denials(session, limit=50, **filters)
+
+    claims_835i = await _fetch_claims_for_export(session, "835I", opts) if opts.include_835i else []
+    claims_835p = await _fetch_claims_for_export(session, "835P", opts) if opts.include_835p else []
+
+    # Observed HCPCS → EAPG crosswalk snapshot
+    observed = set()
+    for c in claims_835i + claims_835p:
+        for sl in c.get("service_lines", []):
+            if sl.get("procedure_code"):
+                observed.add(sl["procedure_code"])
+    reference_codes = []
+    any_dos = next(
+        (c.get("date_of_service") for c in claims_835i + claims_835p if c.get("date_of_service")),
+        None,
+    )
+    if isinstance(any_dos, str):
+        try:
+            any_dos = date.fromisoformat(any_dos)
+        except ValueError:
+            any_dos = None
+    if observed and any_dos:
+        apg = APGEngine()
+        for code in sorted(observed):
+            row = await apg.lookup_hcpcs_eapg(session, code, any_dos)
+            if row is not None:
+                reference_codes.append({
+                    "hcpcs": row.hcpcs,
+                    "eapg": row.eapg,
+                    "eapg_desc": row.eapg_desc,
+                    "eapg_type": row.eapg_type,
+                    "effective": row.quarter_effective_date.isoformat()
+                                   if row.quarter_effective_date else None,
+                })
+
+    # Base rates used by the active provider (all effective dates)
+    base_rates: list[dict] = []
+    if provider:
+        q = await session.execute(
+            select(ApgBaseRate).where(
+                ApgBaseRate.source == provider.provider_type,
+                ApgBaseRate.peer_group == provider.peer_group,
+                ApgBaseRate.region == (provider.region or "Downstate"),
+            ).order_by(ApgBaseRate.effective_date)
+        )
+        for br in q.scalars().all():
+            base_rates.append({
+                "source": br.source, "peer_group": br.peer_group, "region": br.region,
+                "effective_date": br.effective_date.isoformat(), "rate": str(br.rate),
+            })
+
+    return {
+        "generated_at": datetime.utcnow(),
+        "filters": {
+            k: v for k, v in {
+                "date_from": opts.date_from.isoformat() if opts.date_from else None,
+                "date_to": opts.date_to.isoformat() if opts.date_to else None,
+                "payer_name": opts.payer_name,
+            }.items() if v is not None
+        },
+        "provider": provider_dict,
+        "summary": summary,
+        "claims_835i": claims_835i,
+        "claims_835p": claims_835p,
+        "eapg_breakdown": eapg_breakdown,
+        "denials": denials,
+        "reference_codes": reference_codes,
+        "base_rates": base_rates,
+    }
+
+
+async def _fetch_claims_for_export(
+    session: AsyncSession, file_type: str, opts: ExportOptions,
+) -> list[dict]:
+    stmt = select(ORMClaim).where(ORMClaim.file_type == file_type)
+    if opts.date_from:
+        stmt = stmt.where(ORMClaim.date_of_service >= opts.date_from)
+    if opts.date_to:
+        stmt = stmt.where(ORMClaim.date_of_service <= opts.date_to)
+    if opts.payer_name:
+        stmt = stmt.where(ORMClaim.payer_name == opts.payer_name)
+    stmt = stmt.order_by(ORMClaim.date_of_service.desc(), ORMClaim.id.desc())
+    res = await session.execute(stmt)
+    claims = res.scalars().all()
+
+    out = []
+    for c in claims:
+        apg = None
+        if c.apg_result:
+            apg = {
+                "correct_apg_payment": str(c.apg_result.correct_apg_payment),
+                "actual_paid": str(c.apg_result.actual_paid),
+                "variance": str(c.apg_result.variance),
+                "compression_pct": str(c.apg_result.compression_pct),
+                "peer_group": c.apg_result.peer_group,
+                "region": c.apg_result.region,
+                "base_rate_applied": str(c.apg_result.base_rate_applied),
+                "discounting_applied": c.apg_result.discounting_applied,
+                "u6_applied": c.apg_result.u6_applied,
+                "capital_applied": c.apg_result.capital_applied,
+                "line_details": c.apg_result.line_details or [],
+            }
+        out.append({
+            "claim_id": c.claim_id,
+            "date_of_service": c.date_of_service.isoformat() if c.date_of_service else None,
+            "patient_name": c.patient_name,
+            "provider_npi": c.provider_npi,
+            "payer_name": c.payer_name,
+            "billed_amount": str(c.billed_amount),
+            "allowed_amount": str(c.allowed_amount),
+            "paid_amount": str(c.paid_amount),
+            "patient_responsibility": str(c.patient_responsibility),
+            "claim_filing_indicator": c.claim_filing_indicator,
+            "claim_status": c.claim_status,
+            "principal_diagnosis": c.principal_diagnosis,
+            "service_lines": [
+                {
+                    "line_seq": sl.line_seq,
+                    "procedure_code": sl.procedure_code,
+                    "modifiers": list(sl.modifiers or []),
+                    "revenue_code": sl.revenue_code,
+                    "billed_amount": str(sl.billed_amount),
+                    "allowed_amount": str(sl.allowed_amount),
+                    "paid_amount": str(sl.paid_amount),
+                    "units": sl.units,
+                }
+                for sl in c.service_lines
+            ],
+            "apg_result": apg,
+        })
+    return out
+
+
+@app.post("/api/export/excel")
+async def export_excel(opts: ExportOptions, session: AsyncSession = Depends(get_session)) -> Response:
+    payload = await _gather_export_payload(session, opts)
+    blob = ExcelExporter().build(payload)
+    fname = f"apg_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return Response(
+        content=blob,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@app.post("/api/export/pdf")
+async def export_pdf(opts: ExportOptions, session: AsyncSession = Depends(get_session)) -> Response:
+    payload = await _gather_export_payload(session, opts)
+    blob = PDFExporter().build(payload, max_claims=opts.pdf_max_claims)
+    fname = f"apg_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
+    return Response(
+        content=blob,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )

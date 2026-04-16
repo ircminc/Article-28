@@ -4,6 +4,7 @@ import Dashboard from './pages/Dashboard.jsx';
 import Upload from './pages/Upload.jsx';
 import Claims from './pages/Claims.jsx';
 import ClaimDetail from './pages/ClaimDetail.jsx';
+import Reports from './pages/Reports.jsx';
 import Settings from './pages/Settings.jsx';
 
 export default function App() {
@@ -15,6 +16,7 @@ export default function App() {
         <Route path="upload" element={<Upload />} />
         <Route path="claims" element={<Claims />} />
         <Route path="claims/:id" element={<ClaimDetail />} />
+        <Route path="reports" element={<Reports />} />
         <Route path="settings" element={<Settings />} />
         <Route path="*" element={<NotFound />} />
       </Route>

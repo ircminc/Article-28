@@ -5,8 +5,7 @@ Parses Electronic Remittance Advice (**835I**) and Claim (**837**) files
 against the NYS DOH APG methodology to detect underpayments, packaging
 errors, and compression.
 
-**Status:** Phase 3 (React frontend). See [Roadmap](#roadmap) for what's
-landed and what's next.
+**Status:** Phase 4 (analytics + exporters). All four spec phases landed.
 
 ---
 
@@ -240,6 +239,13 @@ open http://localhost:3000                # frontend (Windows: start)
 | GET    | `/api/reference/base-rates`          | 1     | List base rates (filterable)                    |
 | GET    | `/api/reference/cms/{code}?dos=`     | 2     | CMS MPFS rate (cached, live fallback)           |
 | GET    | `/api/reference/zip-locality/{zip}`  | 2     | ZIP → Medicare locality                         |
+| GET    | `/api/analytics/summary`             | 4     | KPI totals (billed / paid / denial / variance)  |
+| GET    | `/api/analytics/compression`         | 4     | Rate compression by EAPG / procedure / peer group |
+| GET    | `/api/analytics/denials`             | 4     | CARC analysis ranked by dollar impact           |
+| GET    | `/api/analytics/trends`              | 4     | Monthly / quarterly billed / paid / variance    |
+| GET    | `/api/analytics/payer-scorecard`     | 4     | Per-payer KPIs                                  |
+| POST   | `/api/export/excel`                  | 4     | Multi-sheet .xlsx report download               |
+| POST   | `/api/export/pdf`                    | 4     | Professional PDF report download                |
 
 ### Upload behavior & auto-enrichment (Phase 2)
 
@@ -316,7 +322,7 @@ ROUND_HALF_UP on exit. Float never touches the money path.
 | 1     | Backend foundation, 835I parser, APG engine, reference data    | ✅ landed |
 | 2     | 835P + 837 parsers, CMS MPFS engine, 837↔835 auto-enrichment   | ✅ landed |
 | 3     | React + Vite + Tailwind SPA (Dashboard, Upload, Claims)        | ✅ landed |
-| 4     | Analytics engine, Excel + PDF exporters                        | pending  |
+| 4     | Analytics engine, Excel + PDF exporters, Reports page, Recharts | ✅ landed |
 
 ### Loading CMS data (Phase 2 — optional)
 

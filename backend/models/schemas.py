@@ -240,3 +240,33 @@ class BaseRateLookupOut(BaseModel):
     region: Region
     effective_date: date
     rate: Decimal
+
+
+# ---------------------------------------------------------------------------
+# Analytics inputs (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+class AnalyticsFilter(BaseModel):
+    """Common filter payload accepted on every analytics endpoint."""
+    date_from: Optional[date] = None
+    date_to: Optional[date] = None
+    payer_name: Optional[str] = None
+    file_type: Optional[str] = None  # '835I' | '835P' | '837I' | '837P'
+    provider_npi: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Export payload (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+class ExportOptions(BaseModel):
+    """POST body for /api/export/excel and /api/export/pdf."""
+    date_from: Optional[date] = None
+    date_to: Optional[date] = None
+    payer_name: Optional[str] = None
+    include_835i: bool = True
+    include_835p: bool = True
+    # Soft cap on per-claim PDF detail pages; the Excel report always has all claims.
+    pdf_max_claims: int = Field(default=25, ge=1, le=500)
