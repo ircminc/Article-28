@@ -35,14 +35,18 @@ services:
       - LOG_LEVEL=INFO
     restart: unless-stopped
 
-  # Phase 3:
-  # frontend:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile.frontend
-  #   ports:
-  #     - "3000:3000"
-  #   depends_on:
-  #     - backend
-  #   environment:
-  #     - VITE_API_URL=http://localhost:8000
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        # In the default compose setup, the browser reaches the backend via
+        # localhost:8000 (both services expose their ports on the host).
+        # For a reverse-proxied deployment, override at build time.
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+    container_name: apg-analyzer-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped

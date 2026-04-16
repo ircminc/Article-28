@@ -5,7 +5,7 @@ Parses Electronic Remittance Advice (**835I**) and Claim (**837**) files
 against the NYS DOH APG methodology to detect underpayments, packaging
 errors, and compression.
 
-**Status:** Phase 2 (parsers + CMS). See [Roadmap](#roadmap) for what's
+**Status:** Phase 3 (React frontend). See [Roadmap](#roadmap) for what's
 landed and what's next.
 
 ---
@@ -70,7 +70,19 @@ Article-28/
 │   ├── engines/apg_engine.py        # APG calculation engine
 │   ├── tests/                       # pytest suite (19 tests, all passing)
 │   └── data/                        # Generated CSV snapshots + SQLite DB (gitignored)
-├── frontend/                        # Phase 3 — React SPA (placeholder)
+├── frontend/                        # React + Vite + Tailwind SPA
+│   ├── package.json
+│   ├── vite.config.js
+│   ├── tailwind.config.js
+│   ├── index.html
+│   └── src/
+│       ├── main.jsx
+│       ├── App.jsx                  # Router + layout
+│       ├── index.css                # Tailwind + component classes
+│       ├── components/              # Layout, Sidebar, HealthBadge, FileDropZone
+│       ├── pages/                   # Dashboard, Upload, Claims, ClaimDetail, Settings
+│       ├── services/api.js          # axios client + React Query hooks
+│       └── utils/format.js          # currency / date / pct formatters
 ├── Dockerfile.backend
 ├── docker-compose.yml
 ├── .env.example
@@ -159,23 +171,52 @@ curl http://localhost:8000/api/claims
 curl http://localhost:8000/api/claims/1/apg
 ```
 
+### 7. Start the frontend (Phase 3)
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Then browse to <http://localhost:3000>. Vite proxies `/api/*` to the FastAPI
+backend on :8000 by default; override with `VITE_API_URL=...` if running the
+backend elsewhere.
+
+The SPA covers:
+
+- **Dashboard** — totals, claim-type mix, recent uploads (full analytics
+  charts arrive with the Phase 4 analytics endpoints)
+- **Upload** — three drop zones (835I / 835P / 837). Uploads trigger the
+  same 837↔835 auto-enrichment as the API.
+- **Claims** — searchable, file-type-filterable, paginated table with
+  linked-sibling indicators
+- **Claim detail** — header totals, APG calculation breakdown with per-line
+  packaging/discount/U6 flags, service lines, adjustments, linked sibling
+- **Settings** — provider configuration (name, NPI, county → region,
+  peer group, provider type, capital add-on, CMS locality)
+
+A `HealthBadge` in the header polls `/api/health` every 30s so you can tell
+at a glance whether the backend is up and the reference data is loaded.
+
 ---
 
 ## Getting started (Docker)
 
 ```bash
-# Build
+# Build both images
 docker compose build
 
-# Start backend
-docker compose up -d backend
+# Start backend + frontend
+docker compose up -d
 
 # One-time reference-data load — point WORKBOOK_DIR at the directory holding the .xlsx
 WORKBOOK_DIR=/path/to/dir docker compose run --rm backend \
     python -m backend.db.init_db --workbook /app/workbooks/your_workbook.xlsx
 
 # Verify
-curl http://localhost:8000/api/health
+curl http://localhost:8000/api/health     # backend
+open http://localhost:3000                # frontend (Windows: start)
 ```
 
 ---
@@ -274,7 +315,7 @@ ROUND_HALF_UP on exit. Float never touches the money path.
 |-------|----------------------------------------------------------------|----------|
 | 1     | Backend foundation, 835I parser, APG engine, reference data    | ✅ landed |
 | 2     | 835P + 837 parsers, CMS MPFS engine, 837↔835 auto-enrichment   | ✅ landed |
-| 3     | React + Vite + Tailwind SPA (Dashboard, Upload, Claims)        | pending  |
+| 3     | React + Vite + Tailwind SPA (Dashboard, Upload, Claims)        | ✅ landed |
 | 4     | Analytics engine, Excel + PDF exporters                        | pending  |
 
 ### Loading CMS data (Phase 2 — optional)

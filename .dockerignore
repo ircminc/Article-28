@@ -1,0 +1,27 @@
+# Keep Docker build contexts lean.
+# PHI / generated files
+backend/uploads/
+backend/exports/
+backend/data/*.db
+backend/data/*.db-journal
+backend/data/*.csv
+
+# Python bytecode
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+
+# Node
+**/node_modules/
+**/dist/
+**/.vite/
+
+# Git / editor
+.git/
+.gitignore
+.claude/
+.idea/
+.vscode/

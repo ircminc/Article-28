@@ -1,0 +1,54 @@
+import { NavLink } from 'react-router-dom';
+import {
+  LayoutDashboard,
+  Upload as UploadIcon,
+  FileStack,
+  Settings as SettingsIcon,
+  Stethoscope,
+} from 'lucide-react';
+
+const NAV = [
+  { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
+  { to: '/upload',    label: 'Upload Files', icon: UploadIcon },
+  { to: '/claims',    label: 'Claims', icon: FileStack },
+  { to: '/settings',  label: 'Settings', icon: SettingsIcon },
+];
+
+export default function Sidebar() {
+  return (
+    <aside className="w-60 bg-brand-700 text-white flex flex-col shrink-0">
+      <div className="h-14 px-5 flex items-center gap-2.5 border-b border-brand-800">
+        <div className="w-8 h-8 rounded-md bg-white/10 grid place-items-center">
+          <Stethoscope className="w-4 h-4 text-white" aria-hidden />
+        </div>
+        <div className="leading-tight">
+          <div className="text-sm font-semibold tracking-tight">IRC Minc</div>
+          <div className="text-[11px] text-brand-200">APG Analyzer</div>
+        </div>
+      </div>
+      <nav className="flex-1 px-2 py-4 space-y-1">
+        {NAV.map(({ to, label, icon: Icon }) => (
+          <NavLink
+            key={to}
+            to={to}
+            className={({ isActive }) =>
+              [
+                'flex items-center gap-2.5 px-3 py-2 rounded-md text-sm transition-colors',
+                isActive
+                  ? 'bg-white/10 text-white font-medium'
+                  : 'text-brand-100 hover:bg-white/5 hover:text-white',
+              ].join(' ')
+            }
+          >
+            <Icon className="w-4 h-4 shrink-0" aria-hidden />
+            <span>{label}</span>
+          </NavLink>
+        ))}
+      </nav>
+      <div className="px-4 py-3 border-t border-brand-800 text-[11px] text-brand-200">
+        <div>Phase 3 build</div>
+        <div>v0.3.0</div>
+      </div>
+    </aside>
+  );
+}

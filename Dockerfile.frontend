@@ -1,0 +1,40 @@
+# APG 835/837 Rate Analyzer — frontend image (Phase 3)
+# Build from the repo root:
+#     docker build -t apg-analyzer-frontend -f Dockerfile.frontend .
+#
+# Two-stage: build in Node, serve with a lightweight static-file server
+# via `vite preview`. For production behind an nginx reverse proxy, consider
+# swapping the runtime stage to nginx:alpine copying dist/.
+
+# --- Build stage -----------------------------------------------------------
+FROM node:20-alpine AS build
+
+WORKDIR /app
+
+# Install deps first for cache efficiency
+COPY frontend/package.json frontend/package-lock.json* /app/
+RUN npm ci --no-audit --no-fund
+
+# Copy source and build
+COPY frontend/ /app/
+# VITE_API_URL is baked into the bundle at build time. Override at build time
+# with --build-arg VITE_API_URL=https://api.example.com for production.
+ARG VITE_API_URL=""
+ENV VITE_API_URL=${VITE_API_URL}
+RUN npm run build
+
+# --- Runtime stage ---------------------------------------------------------
+FROM node:20-alpine AS runtime
+
+WORKDIR /app
+
+# Copy node_modules (for vite preview) and the built dist/
+COPY --from=build /app/node_modules /app/node_modules
+COPY --from=build /app/dist /app/dist
+COPY --from=build /app/package.json /app/
+COPY --from=build /app/vite.config.js /app/
+
+EXPOSE 3000
+
+# `vite preview` serves dist/ over HTTP; host 0.0.0.0 is required inside Docker.
+CMD ["npx", "vite", "preview", "--host", "0.0.0.0", "--port", "3000"]
