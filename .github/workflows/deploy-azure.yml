@@ -1,0 +1,181 @@
+name: Deploy to Azure
+
+# DORMANT. Triggered only by manual dispatch from the Actions tab.
+# Until you've set the required secrets (see below), this workflow fails fast
+# at the "Verify secrets" step. Nothing gets deployed by accident.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   AZURE_CREDENTIALS               Service principal JSON from `az ad sp create-for-rbac`
+#                                   with contributor access to the target RG.
+#   ACR_NAME                        Azure Container Registry name (without .azurecr.io)
+#   AZURE_RESOURCE_GROUP            Resource group the Container App lives in
+#   AZURE_CONTAINER_APP_BACKEND     Container App name for the backend
+#   AZURE_CONTAINER_APP_FRONTEND    Container App name for the frontend
+#   AZURE_CONTAINER_APP_ENV         Container App environment name
+#   APP_JWT_SECRET                  Passed through to the deployed container as env
+#
+# Optional (for the initial bootstrap run only):
+#   APP_ADMIN_USERNAME, APP_ADMIN_PASSWORD    for init-admin job
+#
+# First-time Azure setup (one-time, done outside this workflow):
+#   1. az login
+#   2. az group create -n <rg> -l eastus
+#   3. az acr create -n <acr-name> -g <rg> --sku Basic --admin-enabled true
+#   4. az containerapp env create -n <env-name> -g <rg> -l eastus
+#   5. az ad sp create-for-rbac --name "apg-deploy" --role contributor \
+#        --scopes /subscriptions/<sub>/resourceGroups/<rg> --sdk-auth
+#      → paste the JSON output as AZURE_CREDENTIALS secret
+#   6. See DEPLOY.md §5b for full Container Apps setup.
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (e.g. v0.6.0 or a commit SHA). Default: current commit."
+        required: false
+        default: ""
+      run_init_admin:
+        description: "Also run the admin-bootstrap job after deploy (first-time only)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-azure
+  cancel-in-progress: false
+
+jobs:
+  verify-secrets:
+    name: Verify required secrets are set
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all required secrets are present
+        env:
+          AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+          ACR_NAME: ${{ secrets.ACR_NAME }}
+          AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          AZURE_CONTAINER_APP_BACKEND: ${{ secrets.AZURE_CONTAINER_APP_BACKEND }}
+          AZURE_CONTAINER_APP_FRONTEND: ${{ secrets.AZURE_CONTAINER_APP_FRONTEND }}
+          APP_JWT_SECRET: ${{ secrets.APP_JWT_SECRET }}
+        run: |
+          missing=()
+          for var in AZURE_CREDENTIALS ACR_NAME AZURE_RESOURCE_GROUP \
+                    AZURE_CONTAINER_APP_BACKEND AZURE_CONTAINER_APP_FRONTEND \
+                    APP_JWT_SECRET; do
+            if [ -z "${!var}" ]; then missing+=("$var"); fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing required secrets: ${missing[*]}"
+            echo "Set them under Settings → Secrets and variables → Actions."
+            echo "See .github/workflows/deploy-azure.yml header for the full list."
+            exit 1
+          fi
+          echo "✔ All required secrets present."
+
+  build-and-push:
+    name: Build + push images to ACR
+    runs-on: ubuntu-latest
+    needs: verify-secrets
+    outputs:
+      image_tag: ${{ steps.compute_tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: compute_tag
+        run: |
+          if [ -n "${{ github.event.inputs.image_tag }}" ]; then
+            echo "tag=${{ github.event.inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Log in to ACR
+        run: az acr login --name "${{ secrets.ACR_NAME }}"
+
+      - name: Build + push backend
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.backend
+          push: true
+          tags: |
+            ${{ secrets.ACR_NAME }}.azurecr.io/apg-analyzer-backend:${{ steps.compute_tag.outputs.tag }}
+            ${{ secrets.ACR_NAME }}.azurecr.io/apg-analyzer-backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build + push frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.frontend
+          push: true
+          tags: |
+            ${{ secrets.ACR_NAME }}.azurecr.io/apg-analyzer-frontend:${{ steps.compute_tag.outputs.tag }}
+            ${{ secrets.ACR_NAME }}.azurecr.io/apg-analyzer-frontend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to Container Apps
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    env:
+      TAG: ${{ needs.build-and-push.outputs.image_tag }}
+    steps:
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Update backend container app
+        run: |
+          az containerapp update \
+            --name "${{ secrets.AZURE_CONTAINER_APP_BACKEND }}" \
+            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --image "${{ secrets.ACR_NAME }}.azurecr.io/apg-analyzer-backend:${TAG}"
+
+      - name: Update frontend container app
+        run: |
+          az containerapp update \
+            --name "${{ secrets.AZURE_CONTAINER_APP_FRONTEND }}" \
+            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --image "${{ secrets.ACR_NAME }}.azurecr.io/apg-analyzer-frontend:${TAG}"
+
+      - name: Show backend URL
+        run: |
+          az containerapp show \
+            --name "${{ secrets.AZURE_CONTAINER_APP_BACKEND }}" \
+            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --query 'properties.configuration.ingress.fqdn' -o tsv
+
+  init-admin:
+    name: Bootstrap initial admin (first deploy only)
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: github.event.inputs.run_init_admin == 'true'
+    steps:
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Run init_admin via Container Apps job
+        env:
+          APP_ADMIN_USERNAME: ${{ secrets.APP_ADMIN_USERNAME }}
+          APP_ADMIN_PASSWORD: ${{ secrets.APP_ADMIN_PASSWORD }}
+        run: |
+          if [ -z "$APP_ADMIN_USERNAME" ] || [ -z "$APP_ADMIN_PASSWORD" ]; then
+            echo "::error::APP_ADMIN_USERNAME and APP_ADMIN_PASSWORD secrets must be set."
+            exit 1
+          fi
+          # Exec the bootstrap command inside the running backend container.
+          # A proper Azure Container Apps Job is the cleaner pattern for this;
+          # using `az containerapp exec` keeps the workflow self-contained.
+          az containerapp exec \
+            --name "${{ secrets.AZURE_CONTAINER_APP_BACKEND }}" \
+            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --command "python -m backend.db.init_admin"

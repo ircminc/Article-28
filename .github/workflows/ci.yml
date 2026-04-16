@@ -1,0 +1,119 @@
+name: CI
+
+# Runs on every PR and every push to main/phase-* branches.
+# Goal: catch regressions in parsers, engines, exporters, auth, and frontend
+# build before anything merges.
+#
+# Test strategy:
+#   - We seed synthetic reference data (backend/db/seed_synthetic.py) instead
+#     of depending on the real NYS DOH workbook (which cannot be committed).
+#   - Tests that specifically require final_rate APG records skip cleanly.
+#   - Frontend build verifies every page module compiles and the bundle is
+#     produced — functional tests are out of scope for this pipeline.
+
+on:
+  push:
+    branches:
+      - main
+      - "phase-*"
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-tests:
+    name: Backend (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Stable JWT secret so auth tests have deterministic behavior
+      APP_JWT_SECRET: ci-secret-do-not-use-in-production-32bytes
+      DATABASE_URL: sqlite+aiosqlite:///./backend/data/apg_analyzer.db
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Seed synthetic reference data
+        run: python -m backend.db.seed_synthetic
+
+      - name: Run pytest
+        run: pytest backend/tests/ -v --tb=short
+
+  frontend-build:
+    name: Frontend (build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          if-no-files-found: error
+          retention-days: 7
+
+  docker-build:
+    name: Docker images build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Run only on pushes (not PRs from forks) to avoid wasting build minutes
+    # on transient PR iterations. If we adopt production releases, this
+    # becomes the "tag and push to GHCR" job.
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.backend
+          push: false
+          tags: apg-analyzer-backend:ci-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build frontend image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.frontend
+          push: false
+          tags: apg-analyzer-frontend:ci-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

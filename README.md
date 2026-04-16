@@ -5,10 +5,16 @@ Parses Electronic Remittance Advice (**835I**) and Claim (**837**) files
 against the NYS DOH APG methodology to detect underpayments, packaging
 errors, and compression.
 
-**Status:** Phase 5 (auth + cloud-ready deployment). All four spec phases + auth landed.
+**Status:** Phase 6 (Codespaces + GitHub Actions). Codespaces-ready for team
+testing today, Azure Container Apps wired for the eventual production move.
 
-For cloud deployment instructions (AWS ECS, Azure Container Apps, GCP Cloud
-Run) see [**DEPLOY.md**](./DEPLOY.md).
+**Quick paths to try it:**
+
+| Scenario | Follow |
+|---|---|
+| "Let my team click a URL right now" | [DEPLOY.md §1 — Codespaces](./DEPLOY.md#1-team-testing-on-github-codespaces) |
+| "Run it locally on my Windows box" | [§Getting started (native)](#getting-started-native) below |
+| "Ship to a HIPAA-eligible Azure URL" | [DEPLOY.md §3 — Azure Container Apps](./DEPLOY.md#3-azure-container-apps-production) |
 
 ---
 
@@ -327,6 +333,7 @@ ROUND_HALF_UP on exit. Float never touches the money path.
 | 3     | React + Vite + Tailwind SPA (Dashboard, Upload, Claims)        | ✅ landed |
 | 4     | Analytics engine, Excel + PDF exporters, Reports page, Recharts | ✅ landed |
 | 5     | Per-user login, RBAC, audit log, hardened Docker, cloud deploy guide | ✅ landed |
+| 6     | Codespaces devcontainer, synthetic-data seed, GitHub Actions CI + dormant Azure deploy | ✅ landed |
 
 ### Loading CMS data (Phase 2 — optional)
 

@@ -1,0 +1,83 @@
+{
+  "name": "APG Analyzer — Codespaces",
+  "//": [
+    "Opens a fully-ready dev environment inside GitHub Codespaces.",
+    "Ports 8000 (FastAPI) and 3000 (Vite) are forwarded; set either to",
+    "'Public' in the Ports panel to share with teammates.",
+    "",
+    "First-run sequence (post-create.sh):",
+    "  1. pip install backend deps",
+    "  2. npm install frontend deps",
+    "  3. Seed a synthetic reference dataset (so the app is usable without",
+    "     the proprietary NYS DOH workbook).",
+    "  4. Create the initial admin from Codespaces secrets.",
+    "  5. Print next-step instructions.",
+    "",
+    "Required Codespaces secrets (Settings → Codespaces → Repository secrets):",
+    "  APP_JWT_SECRET         — 32+ random bytes, signs JWTs",
+    "  APP_ADMIN_USERNAME     — e.g. 'admin'",
+    "  APP_ADMIN_PASSWORD     — the initial admin's password (min 10 chars)"
+  ],
+  "image": "mcr.microsoft.com/devcontainers/universal:2-linux",
+  "features": {
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.12",
+      "installTools": true
+    },
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "20"
+    }
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "postStartCommand": "bash .devcontainer/post-start.sh",
+  "forwardPorts": [8000, 3000],
+  "portsAttributes": {
+    "8000": {
+      "label": "Backend API (FastAPI)",
+      "onAutoForward": "notify",
+      "visibility": "private"
+    },
+    "3000": {
+      "label": "Frontend (Vite)",
+      "onAutoForward": "openBrowser",
+      "visibility": "private"
+    }
+  },
+  "remoteEnv": {
+    "DATABASE_URL": "sqlite+aiosqlite:///./backend/data/apg_analyzer.db",
+    "VITE_API_URL": ""
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "charliermarsh.ruff",
+        "ms-azuretools.vscode-docker",
+        "bradlc.vscode-tailwindcss",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "EditorConfig.EditorConfig"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.testing.pytestEnabled": true,
+        "python.testing.pytestArgs": ["backend/tests"],
+        "editor.formatOnSave": true,
+        "files.eol": "\n"
+      }
+    }
+  },
+  "secrets": {
+    "APP_JWT_SECRET": {
+      "description": "HS256 signing secret for JWT auth. Generate with: python -c \"import secrets; print(secrets.token_urlsafe(48))\"",
+      "documentationUrl": "https://docs.github.com/en/codespaces/managing-your-codespaces/managing-your-account-specific-secrets-for-github-codespaces"
+    },
+    "APP_ADMIN_USERNAME": {
+      "description": "Initial admin username (e.g. 'admin')"
+    },
+    "APP_ADMIN_PASSWORD": {
+      "description": "Initial admin password (min 10 chars). You'll use this for first login."
+    }
+  }
+}
