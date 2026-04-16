@@ -51,7 +51,7 @@ export default function Login() {
             <Stethoscope className="w-5 h-5 text-white" aria-hidden />
           </div>
           <div>
-            <div className="text-sm font-semibold text-brand-900">IRC Minc</div>
+            <div className="text-sm font-semibold text-brand-900">PMTAC Pvt Ltd</div>
             <div className="text-xs text-slate-500">APG 835/837 Rate Analyzer</div>
           </div>
         </div>

@@ -69,7 +69,7 @@ def _on_page(canvas, doc, *, gen_at: str):
     canvas.setFillColor(SLATE_500)
     canvas.setFont("Helvetica", 8)
     canvas.drawString(0.75 * inch, 0.5 * inch, f"Generated {gen_at}")
-    canvas.drawCentredString(w / 2, 0.5 * inch, "CONFIDENTIAL — IRC Minc")
+    canvas.drawCentredString(w / 2, 0.5 * inch, "CONFIDENTIAL — PMTAC Pvt Ltd")
     canvas.drawRightString(w - 0.75 * inch, 0.5 * inch, f"Page {doc.page}")
     # Hairline above footer
     canvas.setStrokeColor(SLATE_200)
@@ -120,7 +120,7 @@ class PDFExporter:
             leftMargin=0.75 * inch, rightMargin=0.75 * inch,
             topMargin=0.75 * inch, bottomMargin=0.8 * inch,
             title="APG 835/837 Rate Analyzer Report",
-            author="IRC Minc",
+            author="PMTAC Pvt Ltd",
         )
         frame = Frame(doc.leftMargin, doc.bottomMargin,
                       doc.width, doc.height, id="main")

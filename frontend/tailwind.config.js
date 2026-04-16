@@ -1,5 +1,5 @@
 /** @type {import('tailwindcss').Config} */
-// IRC Minc APG Analyzer palette + Inter font.
+// PMTAC Pvt Ltd — APG Analyzer palette + Inter font.
 // Semantic color tokens map to the standard statuses used across the UI:
 //   brand   = navy for nav/headers       (#1a2e4a)
 //   primary = medical blue for CTAs      (#2563eb)

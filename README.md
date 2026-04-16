@@ -355,7 +355,7 @@ provider config.
 
 ## License
 
-TBD — copyright IRC Minc. Contact the maintainer before distributing.
+TBD — copyright PMTAC Pvt Ltd. Contact the maintainer before distributing.
 
 ---
 

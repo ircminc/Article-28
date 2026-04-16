@@ -217,7 +217,7 @@ WORKBOOK_DIR=/path/on/host WORKBOOK_FILENAME=sample.xlsx \
 APP_ADMIN_USERNAME=admin \
 APP_ADMIN_PASSWORD='<your-chosen-password>' \
 APP_ADMIN_FULLNAME='Site Administrator' \
-APP_ADMIN_EMAIL='admin@ircminc.example' \
+APP_ADMIN_EMAIL='admin@pmtac.example' \
   docker compose -f docker-compose.yml -f docker-compose.production.yml \
     --profile init run --rm init-admin
 ```
@@ -339,7 +339,7 @@ az containerapp show -n "$FRONTEND_APP" -g "$RG" \
 # → apg-frontend.<random>.eastus.azurecontainerapps.io
 ```
 
-Point your real domain (`apg.ircminc.example`) at this FQDN via CNAME. Azure
+Point your real domain (`apg.pmtac.example`) at this FQDN via CNAME. Azure
 Container Apps will auto-provision a managed TLS certificate.
 
 ---

@@ -33,7 +33,7 @@ export default function Sidebar() {
           <Stethoscope className="w-4 h-4 text-white" aria-hidden />
         </div>
         <div className="leading-tight">
-          <div className="text-sm font-semibold tracking-tight">IRC Minc</div>
+          <div className="text-sm font-semibold tracking-tight">PMTAC Pvt Ltd</div>
           <div className="text-[11px] text-brand-200">APG Analyzer</div>
         </div>
       </div>
