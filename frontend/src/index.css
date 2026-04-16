@@ -72,9 +72,64 @@
 }
 
 /* ---------------------------------------------------------------------------
+ * Dark mode — global utility remaps
+ *
+ * Rather than adding dark: to every JSX file, we remap the most-used
+ * Tailwind text/bg/border utilities inside `html.dark` so all pages
+ * become readable automatically. These sit outside @layer so they
+ * reliably override the utility layer.
+ * ------------------------------------------------------------------------- */
+
+/* Text */
+html.dark .text-brand-900  { color: #f1f5f9; }  /* → slate-100 */
+html.dark .text-brand-800  { color: #f1f5f9; }
+html.dark .text-brand-700  { color: #93c5fd; }  /* → blue-300 */
+html.dark .text-slate-800  { color: #e2e8f0; }  /* → slate-200 */
+html.dark .text-slate-700  { color: #cbd5e1; }  /* → slate-300 */
+html.dark .text-slate-600  { color: #cbd5e1; }  /* → slate-300 */
+html.dark .text-slate-500  { color: #94a3b8; }  /* → slate-400 */
+html.dark .text-slate-400  { color: #64748b; }  /* stays muted */
+html.dark .text-danger-700 { color: #fca5a5; }  /* → red-300 */
+html.dark .text-warning-700{ color: #fcd34d; }  /* → amber-300 */
+html.dark .text-success-700{ color: #86efac; }  /* → green-300 */
+html.dark .text-primary-700{ color: #93c5fd; }  /* → blue-300 */
+
+/* Backgrounds — tables, section headers, alternating rows */
+html.dark .bg-slate-50   { background-color: #1e293b; }  /* → slate-800 */
+html.dark .bg-slate-100  { background-color: #1e293b; }  /* → slate-800 */
+html.dark .bg-white      { background-color: #1e293b; }  /* → slate-800 */
+html.dark .bg-page       { background-color: #0f172a; }  /* → slate-900 */
+
+/* Borders + dividers */
+html.dark .border-slate-200 { border-color: #334155; }   /* → slate-700 */
+html.dark .border-slate-100 { border-color: #1e293b; }   /* → slate-800 */
+html.dark .divide-slate-100 > :not([hidden]) ~ :not([hidden]) {
+  border-color: #334155;
+}
+html.dark .divide-slate-200 > :not([hidden]) ~ :not([hidden]) {
+  border-color: #334155;
+}
+
+/* Hover states */
+html.dark .hover\:bg-slate-50:hover  { background-color: #334155; }
+html.dark .hover\:bg-slate-100:hover { background-color: #334155; }
+
+/* Specific component overrides that the utility remap doesn't catch */
+html.dark .bg-primary-50     { background-color: rgba(37, 99, 235, 0.15); }
+html.dark .bg-brand-50       { background-color: rgba(26, 46, 74, 0.3); }
+html.dark .bg-success-50     { background-color: rgba(22, 163, 74, 0.15); }
+html.dark .bg-warning-50     { background-color: rgba(217, 119, 6, 0.15); }
+html.dark .bg-danger-50      { background-color: rgba(220, 38, 38, 0.15); }
+
+/* Login page gradient override */
+html.dark .bg-gradient-to-br { background-image: linear-gradient(to bottom right, #0f172a, #1e293b); }
+
+/* ---------------------------------------------------------------------------
  * Scrollbar: thin, subtle
  * ------------------------------------------------------------------------- */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 5px; }
 ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+html.dark ::-webkit-scrollbar-thumb { background: #475569; }
+html.dark ::-webkit-scrollbar-thumb:hover { background: #64748b; }
