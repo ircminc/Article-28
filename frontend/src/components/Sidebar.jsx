@@ -31,9 +31,11 @@ export default function Sidebar() {
   return (
     <aside className="w-60 bg-brand-700 text-white flex flex-col shrink-0">
       <div className="h-14 px-5 flex items-center gap-2.5 border-b border-brand-800">
-        <div className="w-8 h-8 rounded-md bg-white/10 grid place-items-center">
-          <Stethoscope className="w-4 h-4 text-white" aria-hidden />
-        </div>
+        <img
+          src="/pmtac-logo.png"
+          alt="PMTAC Pvt Ltd"
+          className="h-8 w-auto"
+        />
         <div className="leading-tight">
           <div className="text-sm font-semibold tracking-tight">PMTAC Pvt Ltd</div>
           <div className="text-[11px] text-brand-200">APG Analyzer</div>

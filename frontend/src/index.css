@@ -12,6 +12,8 @@
     font-feature-settings: 'cv11', 'ss01', 'ss03';
   }
   * { box-sizing: border-box; }
+  /* Dark mode body defaults */
+  html.dark body { @apply bg-slate-900 text-slate-100; }
 }
 
 /* ---------------------------------------------------------------------------
@@ -20,7 +22,8 @@
 @layer components {
   /* Surface card — page content containers */
   .card {
-    @apply bg-surface rounded-lg shadow-card border border-slate-200;
+    @apply bg-surface rounded-lg shadow-card border border-slate-200
+           dark:bg-slate-800 dark:border-slate-700 dark:shadow-none;
   }
 
   /* Button variants */
@@ -32,7 +35,8 @@
     @apply btn bg-primary text-white hover:bg-primary-700;
   }
   .btn-secondary {
-    @apply btn bg-white text-brand-900 border border-slate-300 hover:bg-slate-50;
+    @apply btn bg-white text-brand-900 border border-slate-300 hover:bg-slate-50
+           dark:bg-slate-700 dark:text-slate-100 dark:border-slate-600 dark:hover:bg-slate-600;
   }
   .btn-danger {
     @apply btn bg-danger text-white hover:bg-danger-700;
@@ -40,28 +44,31 @@
 
   /* Labels + inputs */
   .label {
-    @apply block text-sm font-medium text-slate-700 mb-1;
+    @apply block text-sm font-medium text-slate-700 mb-1
+           dark:text-slate-300;
   }
   .input, .select, .textarea {
     @apply block w-full px-3 py-2 text-sm border border-slate-300 rounded-md
            bg-white shadow-sm placeholder:text-slate-400
            focus:outline-none focus:ring-2 focus:ring-primary/40 focus:border-primary
-           disabled:bg-slate-50 disabled:text-slate-500;
+           disabled:bg-slate-50 disabled:text-slate-500
+           dark:bg-slate-700 dark:border-slate-600 dark:text-slate-100
+           dark:placeholder:text-slate-500 dark:disabled:bg-slate-800;
   }
 
   /* Status pills */
   .pill {
     @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold;
   }
-  .pill-success { @apply pill bg-success-50 text-success-700; }
-  .pill-warning { @apply pill bg-warning-50 text-warning-700; }
-  .pill-danger  { @apply pill bg-danger-50 text-danger-700; }
-  .pill-brand   { @apply pill bg-brand-50 text-brand-700; }
-  .pill-slate   { @apply pill bg-slate-100 text-slate-700; }
+  .pill-success { @apply pill bg-success-50 text-success-700 dark:bg-success-700/20 dark:text-green-300; }
+  .pill-warning { @apply pill bg-warning-50 text-warning-700 dark:bg-warning-700/20 dark:text-amber-300; }
+  .pill-danger  { @apply pill bg-danger-50 text-danger-700 dark:bg-danger-700/20 dark:text-red-300; }
+  .pill-brand   { @apply pill bg-brand-50 text-brand-700 dark:bg-brand-500/20 dark:text-blue-300; }
+  .pill-slate   { @apply pill bg-slate-100 text-slate-700 dark:bg-slate-700 dark:text-slate-300; }
 
   /* KPI card numbers */
-  .kpi-value { @apply text-2xl font-semibold text-brand-900 tabular-nums; }
-  .kpi-label { @apply text-xs uppercase tracking-wide text-slate-500; }
+  .kpi-value { @apply text-2xl font-semibold text-brand-900 tabular-nums dark:text-white; }
+  .kpi-label { @apply text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400; }
 }
 
 /* ---------------------------------------------------------------------------

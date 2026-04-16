@@ -7,6 +7,7 @@
 //   warning = compression / review       (#d97706)
 //   danger  = denials / underpayments    (#dc2626)
 export default {
+  darkMode: 'class',
   content: ['./index.html', './src/**/*.{js,jsx}'],
   theme: {
     extend: {

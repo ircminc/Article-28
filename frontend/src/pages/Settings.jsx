@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Save, AlertCircle, CheckCircle2, Trash2 } from 'lucide-react';
+import { Save, AlertCircle, CheckCircle2, Trash2, RefreshCw, Upload as UploadIcon } from 'lucide-react';
 import {
   clearAllClaims,
+  clearCmsCache,
   extractErrorMessage,
   getProvider,
+  reloadReferenceData,
   upsertProvider,
 } from '../services/api.js';
 import { useAuth } from '../auth/AuthContext.jsx';
@@ -284,10 +286,140 @@ export default function Settings() {
         </div>
       </form>
 
-      {/* Danger zone — admin + analyst only (viewer role is hidden).
-          The button itself still triggers a browser confirm() before firing. */}
+      {/* Reference data management — admin + analyst */}
+      {user && (user.role === 'admin' || user.role === 'analyst') && (
+        <ReferenceDataTools queryClient={queryClient} isAdmin={user.role === 'admin'} />
+      )}
+
+      {/* Danger zone — admin + analyst only */}
       {user && (user.role === 'admin' || user.role === 'analyst') && (
         <DangerZone queryClient={queryClient} />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Reference data management — CMS cache refresh + APG workbook upload
+// ---------------------------------------------------------------------------
+
+function ReferenceDataTools({ queryClient, isAdmin }) {
+  const cmsMut = useMutation({
+    mutationFn: clearCmsCache,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['health'] }),
+  });
+
+  const [workbookFile, setWorkbookFile] = useState(null);
+  const uploadMut = useMutation({
+    mutationFn: (file) => reloadReferenceData(file),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['health'] });
+      queryClient.invalidateQueries({ queryKey: ['analytics'] });
+      setWorkbookFile(null);
+    },
+  });
+
+  return (
+    <div className="card p-6 space-y-5">
+      <div>
+        <h2 className="text-sm font-semibold text-brand-900 dark:text-white uppercase tracking-wide">
+          Reference data management
+        </h2>
+        <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
+          Keep APG and CMS rate data current when NYS DOH or CMS publish updates.
+        </p>
+      </div>
+
+      {/* CMS cache refresh */}
+      <div className="border-t border-slate-200 dark:border-slate-700 pt-4">
+        <h3 className="text-sm font-medium text-slate-700 dark:text-slate-300">
+          CMS MPFS rate cache
+        </h3>
+        <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+          The app caches CMS Medicare fee schedule rates for 24 hours. If CMS
+          publishes a mid-year update and you want fresh rates immediately,
+          flush the cache below. The next Rate Calculator or 835P lookup will
+          fetch live from data.cms.gov.
+        </p>
+        <div className="mt-3 flex items-center gap-3">
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={() => cmsMut.mutate()}
+            disabled={cmsMut.isPending}
+          >
+            <RefreshCw className="w-4 h-4" aria-hidden />
+            {cmsMut.isPending ? 'Clearing…' : 'Refresh CMS cache'}
+          </button>
+          {cmsMut.isSuccess && (
+            <span className="pill-success">
+              <CheckCircle2 className="w-3 h-3" aria-hidden />
+              Cleared {cmsMut.data?.cached_rates_cleared ?? 0} cached rate(s).
+            </span>
+          )}
+          {cmsMut.isError && (
+            <span className="pill-danger">
+              <AlertCircle className="w-3 h-3" aria-hidden />
+              {extractErrorMessage(cmsMut.error)}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* APG workbook upload (admin only) */}
+      {isAdmin && (
+        <div className="border-t border-slate-200 dark:border-slate-700 pt-4">
+          <h3 className="text-sm font-medium text-slate-700 dark:text-slate-300">
+            APG reference data (NYS DOH workbook)
+          </h3>
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+            When NYS DOH publishes updated APG weights, base rates, or
+            HCPCS/ICD-10 crosswalks, download their updated Excel workbook and
+            upload it here. This replaces the 5 reference tables (HCPCS→EAPG,
+            ICD-10→EAPG, APG weights, base rates, provider county) while
+            preserving all users, claims, and settings.
+          </p>
+          <div className="mt-3 flex items-center gap-3 flex-wrap">
+            <label className="btn-secondary cursor-pointer">
+              <UploadIcon className="w-4 h-4" aria-hidden />
+              {workbookFile ? workbookFile.name : 'Choose workbook (.xlsx)'}
+              <input
+                type="file"
+                accept=".xlsx,.xlsm"
+                className="hidden"
+                onChange={(e) => setWorkbookFile(e.target.files[0] || null)}
+              />
+            </label>
+            {workbookFile && (
+              <button
+                type="button"
+                className="btn-primary"
+                onClick={() => uploadMut.mutate(workbookFile)}
+                disabled={uploadMut.isPending}
+              >
+                {uploadMut.isPending ? 'Loading workbook…' : 'Upload & reload'}
+              </button>
+            )}
+            {uploadMut.isSuccess && (
+              <span className="pill-success">
+                <CheckCircle2 className="w-3 h-3" aria-hidden />
+                Reference data reloaded from {uploadMut.data?.filename}.
+              </span>
+            )}
+            {uploadMut.isError && (
+              <span className="pill-danger">
+                <AlertCircle className="w-3 h-3" aria-hidden />
+                {extractErrorMessage(uploadMut.error)}
+              </span>
+            )}
+          </div>
+          {uploadMut.isPending && (
+            <p className="text-xs text-slate-500 mt-2">
+              This takes 1–3 minutes for a full workbook (~90,000 rows).
+              Please don't close the page.
+            </p>
+          )}
+        </div>
       )}
     </div>
   );

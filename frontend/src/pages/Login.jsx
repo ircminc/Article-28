@@ -47,9 +47,7 @@ export default function Login() {
     <div className="min-h-screen grid place-items-center bg-gradient-to-br from-brand-700 to-brand-900 px-4">
       <div className="w-full max-w-md card p-8 space-y-5 shadow-xl">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-md bg-brand-700 grid place-items-center">
-            <Stethoscope className="w-5 h-5 text-white" aria-hidden />
-          </div>
+          <img src="/pmtac-logo.png" alt="PMTAC Pvt Ltd" className="h-10 w-auto" />
           <div>
             <div className="text-sm font-semibold text-brand-900">PMTAC Pvt Ltd</div>
             <div className="text-xs text-slate-500">APG 835/837 Rate Analyzer</div>

@@ -638,6 +638,74 @@ async def get_claim_apg(
     }
 
 
+@app.delete("/api/admin/cms-cache", status_code=200)
+async def clear_cms_cache(
+    current: RequireAnalyst,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Flush the CMS MPFS rate cache. Next CMS lookup will hit the live API.
+
+    Admin or analyst only. Useful when CMS publishes a mid-year update and
+    you don't want to wait for the 24h TTL to expire naturally.
+    """
+    from backend.db.database import CmsRateCache
+    n = (await session.execute(select(func.count()).select_from(CmsRateCache))).scalar_one()
+    await session.execute(delete(CmsRateCache))
+    await audit(
+        session, user=current, request=request,
+        action="cms_cache.clear", resource=f"{n} cached rate(s)",
+    )
+    await session.commit()
+    return {"cached_rates_cleared": n}
+
+
+@app.post("/api/admin/reload-reference-data")
+async def reload_reference_data(
+    current: RequireAdmin,
+    request: Request,
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Upload a new NYS DOH workbook and reload all reference tables.
+
+    Admin only. Accepts an .xlsx file, writes it to a temp location, and
+    runs the same init_db logic as the CLI. Existing claims, users, audit
+    log, and CMS cache are preserved — only the 5 APG reference tables
+    are replaced (hcpcs_to_eapg, icd10_to_eapg, apg_weights, apg_base_rates,
+    provider_county).
+    """
+    import tempfile
+    from pathlib import Path
+    from backend.db.init_db import run as run_init_db
+
+    if not file.filename.endswith(('.xlsx', '.xlsm')):
+        raise HTTPException(400, "File must be an Excel workbook (.xlsx or .xlsm)")
+
+    # Write to a temp file so the init_db loader can read it with openpyxl
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+        content = await file.read()
+        tmp.write(content)
+        tmp_path = Path(tmp.name)
+
+    try:
+        await run_init_db(tmp_path)
+    except Exception as e:
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(500, f"Failed to load workbook: {e}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    await audit(
+        session, user=current, request=request,
+        action="reference_data.reload",
+        resource=file.filename,
+        details={"file_size": len(content)},
+    )
+    await session.commit()
+    return {"ok": True, "filename": file.filename, "message": "Reference data reloaded successfully."}
+
+
 @app.delete("/api/claims", status_code=200)
 async def clear_all_claims(
     current: RequireAnalyst,

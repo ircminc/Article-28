@@ -87,6 +87,23 @@ export async function calculateRate(payload) {
   return data;
 }
 
+// Admin: clear the CMS MPFS rate cache (forces live re-fetch on next lookup)
+export async function clearCmsCache() {
+  const { data } = await apiClient.delete('/api/admin/cms-cache');
+  return data;
+}
+
+// Admin: upload a new NYS DOH workbook to reload APG reference data
+export async function reloadReferenceData(file) {
+  const form = new FormData();
+  form.append('file', file);
+  const { data } = await apiClient.post('/api/admin/reload-reference-data', form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 300_000,  // workbook parsing can take a few minutes
+  });
+  return data;
+}
+
 // ---------------------------------------------------------------------------
 // Uploads
 // ---------------------------------------------------------------------------
