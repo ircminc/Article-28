@@ -335,11 +335,19 @@ function ReferenceDataTools({ queryClient, isAdmin }) {
         <h3 className="text-sm font-medium text-slate-700 dark:text-slate-300">
           CMS MPFS rate cache
         </h3>
-        <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-          The app caches CMS Medicare fee schedule rates for 24 hours. If CMS
-          publishes a mid-year update and you want fresh rates immediately,
-          flush the cache below. The next Rate Calculator or 835P lookup will
-          fetch live from data.cms.gov.
+        <div className="mt-2 p-3 rounded-md bg-warning-50 border border-warning text-xs text-warning-700">
+          <strong>Heads up:</strong> the CMS MPFS integration is currently being
+          updated. CMS migrated their Physician Fee Schedule API to a new
+          subdomain (<code>pfs.data.cms.gov</code>) with a new schema, and our
+          dataset reference has been retired. APG / Article 28 calculations
+          are unaffected. CMS rates will return once the integration is
+          rewritten against the new API.
+        </div>
+        <p className="text-xs text-slate-500 dark:text-slate-400 mt-3">
+          When CMS integration is back: the app caches Medicare fee schedule
+          rates for 24 hours. If CMS publishes a mid-year update and you want
+          fresh rates immediately, flush the cache below. The next lookup will
+          fetch live from the new CMS API.
         </p>
         <div className="mt-3 flex items-center gap-3">
           <button

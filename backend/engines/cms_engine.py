@@ -53,6 +53,14 @@ _DEFAULT_RATE_LIMIT_CONCURRENT = 10
 _DEFAULT_TIMEOUT_SECONDS = 20
 
 
+class CMSDatasetMovedError(Exception):
+    """Raised when the CMS dataset URL returns 404 — typically because CMS
+    retired the dataset ID when publishing a new annual fee schedule. The
+    calculator surfaces this as a banner message rather than per-line errors.
+    """
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Response shape
 # ---------------------------------------------------------------------------
@@ -212,8 +220,27 @@ class CMSFeeScheduleEngine:
             try:
                 resp = await self._client.get(self.base_url, params=params)
             except httpx.RequestError as e:
+                # Network / transport error — caller will fall back to stale
+                # cache if present. This is the 'CMS API unreachable' path,
+                # NOT the 'dataset moved' path.
                 log.warning("CMS API request failed: %s", e)
                 return None
+
+        if resp.status_code == 404:
+            # Dataset has been deprecated / URL has moved. This is the signal
+            # that the CMS integration needs to be updated to the new API.
+            # Raise a specific sentinel so the calculator endpoint can show a
+            # one-time banner instead of confusing per-line errors.
+            log.warning(
+                "CMS dataset %s returned 404. The dataset ID may be stale — "
+                "CMS migrated PFS data to pfs.data.cms.gov and retires old "
+                "dataset IDs annually. Update CMS_DATASET_ID in cms_engine.py.",
+                CMS_DATASET_ID,
+            )
+            raise CMSDatasetMovedError(
+                "CMS MPFS dataset is no longer available at the expected URL. "
+                "The dataset has likely been migrated by CMS."
+            )
 
         if resp.status_code != 200:
             log.warning("CMS API non-200 status %s for %s", resp.status_code, params)

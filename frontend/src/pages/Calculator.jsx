@@ -26,7 +26,11 @@ export default function Calculator() {
   const [dos, setDos] = useState(TODAY);
   const [principalDx, setPrincipalDx] = useState('');
   const [otherDx, setOtherDx] = useState('');
-  const [target, setTarget] = useState('both');
+  // Default to APG-only because the CMS MPFS integration is currently
+  // out of sync with CMS's new pfs.data.cms.gov API. Users who need CMS
+  // lookups can still pick it from the dropdown; they'll see a banner
+  // explaining the status.
+  const [target, setTarget] = useState('apg');
   const [cmsLocality, setCmsLocality] = useState('');
   const [useFacilityRate, setUseFacilityRate] = useState(false);
   const [includePcTc, setIncludePcTc] = useState(false);

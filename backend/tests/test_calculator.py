@@ -422,6 +422,46 @@ async def test_apg_variance_uses_paid_field(clean_db, client):
 
 
 @pytest.mark.asyncio
+async def test_cms_dataset_moved_surfaces_as_banner_warning(clean_db, client):
+    """When the CMS dataset URL returns 404 (CMS migrated their API), the
+    calculator should hide the CMS panel and surface a single friendly
+    warning message — not a per-line error spam."""
+    from backend.engines.cms_engine import CMSDatasetMovedError
+
+    token = await _make_analyst()
+    await _seed_provider(cms_locality="01")
+
+    async def fake_get_mpfs_raises(self, session, hcpcs, modifier, locality, year, **_):
+        raise CMSDatasetMovedError(
+            "CMS MPFS dataset is no longer available at the expected URL."
+        )
+
+    with patch(
+        "backend.engines.cms_engine.CMSFeeScheduleEngine.get_mpfs_rate",
+        new=fake_get_mpfs_raises,
+    ):
+        r = client.post("/api/calculator/calculate",
+                        headers={"Authorization": f"Bearer {token}"},
+                        json={
+                            "date_of_service": "2023-06-15",
+                            "service_lines": [
+                                {"procedure_code": "99213"},
+                                {"procedure_code": "17000"},
+                            ],
+                            "target": "cms",
+                        })
+
+    assert r.status_code == 200
+    body = r.json()
+    # No per-line CMS errors — the whole panel is hidden
+    assert body["cms_lines"] is None
+    assert body["cms_locality_used"] is None
+    # Instead, a single banner-level warning explaining the situation
+    assert any("CMS MPFS integration is being updated" in w
+               for w in body["warnings"]), body["warnings"]
+
+
+@pytest.mark.asyncio
 async def test_both_returns_apg_and_cms(clean_db, client):
     token = await _make_analyst()
     await _seed_provider(cms_locality="01")

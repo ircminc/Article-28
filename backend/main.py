@@ -996,6 +996,7 @@ async def calculator_calculate(
             warnings.append("CMS skipped: no locality (pass cms_locality or configure provider).")
         else:
             import asyncio as _asyncio
+            from backend.engines.cms_engine import CMSDatasetMovedError
             cms_locality_used = locality
             cms = get_cms_engine()
             year = payload.date_of_service.year
@@ -1016,11 +1017,16 @@ async def calculator_calculate(
                         row, pro_row, tec_row = await _asyncio.gather(
                             base_task, pro_task, tec_task, return_exceptions=False,
                         )
+                    except CMSDatasetMovedError:
+                        # Propagate so the outer handler can show a banner
+                        raise
                     except Exception as e:
                         return CalculatorLineCMS(procedure_code=code, error=f"CMS API error: {e}")
                 else:
                     try:
                         row = await base_task
+                    except CMSDatasetMovedError:
+                        raise
                     except Exception as e:
                         return CalculatorLineCMS(procedure_code=code, error=f"CMS API error: {e}")
                     pro_row = tec_row = None
@@ -1059,7 +1065,23 @@ async def calculator_calculate(
             # Process lines in parallel across the top level too, not just
             # within a single line's PC/TC fetches. Semaphore in CMSFeeScheduleEngine
             # caps total concurrent outbound HTTP requests to 10.
-            cms_lines = list(await _asyncio.gather(*[_one_line(sl) for sl in payload.service_lines]))
+            try:
+                cms_lines = list(await _asyncio.gather(
+                    *[_one_line(sl) for sl in payload.service_lines]
+                ))
+            except CMSDatasetMovedError:
+                # The CMS dataset URL has been retired. Don't spam per-line
+                # errors — surface a single banner-level warning + set
+                # cms_lines to None so the UI knows to hide the CMS panel.
+                cms_lines = None
+                cms_locality_used = None
+                warnings.append(
+                    "CMS MPFS integration is being updated — CMS migrated their "
+                    "Physician Fee Schedule API to a new schema and our dataset "
+                    "reference has been retired. APG/Article 28 results are "
+                    "unaffected. CMS rates will return once the integration is "
+                    "updated against the new pfs.data.cms.gov API."
+                )
 
     return CalculatorOut(
         date_of_service=payload.date_of_service,
