@@ -1,14 +1,4 @@
-"""Throwaway discovery script — NOT part of the app.
-
-Purpose: figure out what the current CMS Physician Fee Schedule dataset is
-called in the data.json catalog, what its UUID is, and what fields it has
-(HCPCS_CD? HCPCS? LOCALITY? LOCALITY_NUM?).
-
-Run in a Codespace terminal:
-    python _scratch/discover_cms_api.py > cms_discovery.txt
-
-Then paste cms_discovery.txt back in chat.
-"""
+"""v2 — CMS moved PFS data to pfs.data.cms.gov subdomain. Try that catalog."""
 from __future__ import annotations
 
 import json
@@ -18,107 +8,122 @@ import urllib.parse
 import urllib.request
 
 
-CATALOG_URL = "https://data.cms.gov/data.json"
-KEYWORDS = ("physician fee schedule", "pfs", "mpfs")
+# Candidate catalog URLs — try each, look for any that returns a data.json payload.
+CATALOG_CANDIDATES = [
+    "https://pfs.data.cms.gov/data.json",
+    "https://pfs.data.cms.gov/api/1/metastore/schemas/dataset/items",
+    "https://data.cms.gov/data.json",   # main catalog (already tested — no PFS)
+]
+
+# Known UUIDs from earlier web searches — use these to probe the API even
+# without the catalog.
+KNOWN_UUIDS = {
+    "Indicators for 2025": "1a4e7cb4-65db-48fd-8250-a64a3cc6e583",
+    "Indicators for 2024A": "b9841b4a-9811-41e2-ae5a-c00d51b19df1",
+    "Localities for 2025": "2c07a8fe-ac99-4ae6-855f-e6fe7597dc8b",
+    "Localities for 2023": "c4225a3a-4abe-40a4-bb8c-65dcd1ebe8e8",
+}
+
+# API base URLs to try per UUID
+API_BASES = [
+    "https://pfs.data.cms.gov/data-api/v1/dataset/{uuid}/data",
+    "https://data.cms.gov/data-api/v1/dataset/{uuid}/data",
+    "https://pfs.data.cms.gov/api/1/datastore/sql?query=[SELECT * FROM {uuid}][LIMIT 1]",
+]
 
 
-def http_get_json(url: str) -> dict | list:
+def http_get(url: str, timeout: int = 60) -> tuple[int, str]:
     req = urllib.request.Request(url, headers={"User-Agent": "APG-Analyzer/discovery"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            return resp.status, body
+    except urllib.error.HTTPError as e:
+        return e.code, (e.read().decode("utf-8", errors="replace") if e.fp else str(e))
+    except Exception as e:
+        return 0, f"{type(e).__name__}: {e}"
+
+
+def print_section(title: str) -> None:
+    print()
+    print("=" * 72)
+    print(title)
+    print("=" * 72)
+
+
+def try_catalogs() -> list[dict]:
+    """Return list of PFS-matching datasets found across catalog candidates."""
+    all_matches: list[dict] = []
+    for url in CATALOG_CANDIDATES:
+        print_section(f"Trying catalog: {url}")
+        status, body = http_get(url)
+        print(f"HTTP {status}, body length {len(body)}")
+        if status != 200:
+            print(f"First 300 chars: {body[:300]}")
+            continue
+        try:
+            data = json.loads(body)
+        except Exception as e:
+            print(f"Not JSON: {e}; first 300 chars: {body[:300]}")
+            continue
+
+        # Handle both data.json (has 'dataset' array) and metastore (array at top)
+        datasets = data.get("dataset", data) if isinstance(data, dict) else data
+        if not isinstance(datasets, list):
+            print(f"Unexpected catalog shape (top keys: {list(data.keys()) if isinstance(data, dict) else '?'})")
+            continue
+        print(f"Catalog has {len(datasets)} dataset(s).")
+
+        # Find "Pricing" / "Indicators" / "Localities" datasets for recent years
+        for ds in datasets:
+            title = (ds.get("title") or ds.get("name") or "").strip()
+            if not title:
+                continue
+            tlow = title.lower()
+            if any(k in tlow for k in ("pricing", "physician fee", "pfs", "mpfs", "indicators for", "localities for")):
+                print(f"  MATCH: {title}")
+                all_matches.append({**ds, "_catalog_url": url})
+
+    return all_matches
+
+
+def probe_uuid(uuid: str, label: str) -> None:
+    """Try each API base URL with this UUID; report what works."""
+    print_section(f"Probe UUID: {label}  ({uuid})")
+    for base_tmpl in API_BASES:
+        url = base_tmpl.format(uuid=uuid) + ("?size=1" if "?" not in base_tmpl else "&limit=1")
+        status, body = http_get(url, timeout=30)
+        short = body[:200].replace("\n", " ")
+        print(f"  [{status}] {url[:90]}...")
+        print(f"          ↳ {short}")
+        if status == 200 and body.startswith(("[", "{")):
+            try:
+                j = json.loads(body)
+                if isinstance(j, list) and j:
+                    print(f"  ✓ WORKS. Field names: {list(j[0].keys())}")
+                    print(f"    Sample row: {j[0]}")
+                    return
+                if isinstance(j, dict) and j.get("data"):
+                    print(f"  ✓ WORKS (wrapped). Top-level keys: {list(j.keys())}")
+                    if isinstance(j["data"], list) and j["data"]:
+                        print(f"    Field names: {list(j['data'][0].keys())}")
+                        print(f"    Sample row: {j['data'][0]}")
+                    return
+            except Exception as e:
+                print(f"  (json parse: {e})")
 
 
 def main() -> None:
-    print(f"Fetching catalog: {CATALOG_URL}")
-    catalog = http_get_json(CATALOG_URL)
-    datasets = catalog.get("dataset", [])
-    print(f"Total datasets in catalog: {len(datasets)}")
+    matches = try_catalogs()
+
     print()
+    print_section(f"Summary: {len(matches)} catalog-listed match(es) across all sources")
+    for m in matches[:20]:
+        print(f"  {m.get('title')} — id={m.get('identifier') or m.get('id', '?')}")
 
-    # Find candidate PFS / MPFS datasets
-    matches = []
-    for ds in datasets:
-        title = (ds.get("title") or "").lower()
-        desc = (ds.get("description") or "").lower()[:200]
-        hay = f"{title} {desc}"
-        if any(kw in hay for kw in KEYWORDS):
-            matches.append(ds)
-
-    print(f"== {len(matches)} dataset(s) matching physician fee schedule / PFS / MPFS ==")
-    print()
-
-    for i, ds in enumerate(matches, 1):
-        print(f"--- Match #{i} ---")
-        print(f"Title:       {ds.get('title')}")
-        print(f"Identifier:  {ds.get('identifier')}")
-        print(f"Description: {(ds.get('description') or '')[:200]}")
-        modified = ds.get("modified")
-        if modified:
-            print(f"Modified:    {modified}")
-        distributions = ds.get("distribution", [])
-        print(f"Distributions: {len(distributions)}")
-        # Show the 'latest' API distribution if present
-        for dist in distributions:
-            if dist.get("description") == "latest" and dist.get("format") == "API":
-                access_url = dist.get("accessURL", "")
-                print(f"  LATEST API URL: {access_url}")
-                # Extract the UUID from the URL
-                m = re.search(r"/dataset/([0-9a-f-]{36})/", access_url or "")
-                if m:
-                    uuid = m.group(1)
-                    print(f"  LATEST UUID:    {uuid}")
-                    # Fetch a sample row to discover field names
-                    sample_url = f"{access_url}?size=1"
-                    print(f"  Sampling one row from: {sample_url}")
-                    try:
-                        sample = http_get_json(sample_url)
-                    except Exception as e:
-                        print(f"  ERROR sampling: {e}")
-                    else:
-                        if isinstance(sample, list) and sample:
-                            fields = list(sample[0].keys())
-                            print(f"  Field names ({len(fields)}): {fields}")
-                            print(f"  First row sample:")
-                            for k, v in list(sample[0].items())[:20]:
-                                print(f"    {k} = {v!r}")
-                        else:
-                            print(f"  Sample returned: {sample!r}")
-                break
-        print()
-
-    # If we found candidates, try the first one with our actual query (HCPCS 99213)
-    if matches:
-        first = matches[0]
-        for dist in first.get("distribution", []):
-            if dist.get("description") == "latest" and dist.get("format") == "API":
-                access_url = dist.get("accessURL", "")
-                print("=" * 70)
-                print(f"Trying a real HCPCS lookup against: {first.get('title')}")
-                print(f"Query: 99213, locality 01")
-                print("=" * 70)
-                # Try several field name candidates
-                for hcpcs_field in ("HCPCS_CD", "HCPCS_CODE", "HCPCS", "PROC_CODE"):
-                    for locality_field in ("LOCALITY_NUM", "LOCALITY", "LOCALITY_CD", "MAC_LOCALITY"):
-                        qs = urllib.parse.urlencode({
-                            f"filter[{hcpcs_field}]": "99213",
-                            f"filter[{locality_field}]": "01",
-                            "size": "3",
-                        })
-                        test_url = f"{access_url}?{qs}"
-                        try:
-                            result = http_get_json(test_url)
-                        except Exception as e:
-                            continue
-                        if isinstance(result, list) and result:
-                            print(f"  ✓ HIT with filters {hcpcs_field} + {locality_field}")
-                            print(f"  URL: {test_url}")
-                            print(f"  Returned {len(result)} row(s), first row:")
-                            for k, v in list(result[0].items())[:25]:
-                                print(f"    {k} = {v!r}")
-                            return
-                print("  No combination of common field names returned data.")
-                print("  → you'll need to inspect the full field list above and tell Claude the correct names.")
-                break
+    # Probe the known UUIDs regardless
+    for label, uuid in KNOWN_UUIDS.items():
+        probe_uuid(uuid, label)
 
 
 if __name__ == "__main__":
