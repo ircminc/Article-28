@@ -45,10 +45,11 @@ Thumbs.db
 .vscode/
 
 # Scratch (local-only exploration files)
-_scratch/
+
 
 # Claude Code per-user settings (tool permissions). Shared settings.json is OK to commit.
 .claude/settings.local.json
 
 # Stray SQLite files if someone runs with a legacy CWD-relative DB path
 /data/
+_scratch/

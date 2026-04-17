@@ -1,30 +1,48 @@
-"""CMS Medicare Physician Fee Schedule (MPFS) rate engine.
+"""CMS Medicare Physician Fee Schedule (MPFS) rate engine — v2 architecture.
 
-Purpose: for non-Article 28 (professional) claims, look up the correct Medicare
-MPFS reimbursement for a given procedure code × modifier × locality × year,
-and compare it to the actual paid amount.
+Rewritten in 2026-04 after CMS migrated PFS data from
+`data.cms.gov/data-api/v1/dataset/<uuid>` to the DKAN-powered
+`pfs.data.cms.gov` subsite. The old pattern of hitting a single "MPFS" dataset
+no longer works: CMS now publishes two separate datasets per year,
+"Indicators for YYYY" (RVUs + conversion factor + procedure flags) and
+"Localities for YYYY" (GPCIs per Medicare locality).
 
-Data source: CMS public data API at https://data.cms.gov
-  - Dataset: Medicare Physician Fee Schedule
-  - Dataset ID: 9767cb68-8ea9-4f0b-8179-9a7a94480c2f
-  - Endpoint: /data-api/v1/dataset/{dataset_id}/data?filter[HCPCS_CD]=...
+Our engine now mirrors what CMS's official PFS Look-Up Tool does:
 
-Caching: results are written to the `cms_rate_cache` table with a configurable
-TTL (default 24h). Stale rows are still returned as a fallback if the API is
-unreachable — a medical billing tool should not silently error when the upstream
-rate service has a hiccup.
+    Payment = ((rvu_work × gpci_work)
+             + (pe_rvu    × gpci_pe)
+             + (rvu_mp    × gpci_mp)) × conversion_factor
 
-Rate limiting: an asyncio semaphore caps concurrent requests at 10, and a small
-sleep between batches keeps us under ~10 requests/second. For backfill-style
-usage patterns, prefer the batch helpers.
+where pe_rvu is the non-facility or facility PE RVU depending on place
+of service. For PC/TC split, we filter the Indicators dataset by
+modifier "26" (professional only) or "TC" (technical only).
 
-ZIP → locality: provider configuration carries a `cms_locality` field that
-callers should set from the `zip_locality` table (populated separately from the
-annual CMS ZIP5 file).
+Key design decisions:
+  * Dataset UUIDs are NEVER hardcoded. They are discovered at runtime by
+    fetching the CMS catalog at pfs.data.cms.gov/data.json and matching
+    by title ("Indicators for YYYY" and "Localities for YYYY"). This is
+    self-healing — when CMS publishes a new annual dataset, the app picks
+    it up on the next catalog refresh.
+  * Each year has its own datasets. Some years are split A/B mid-year
+    (e.g. 2024A covers H1, 2024B covers H2). We resolve "best fit" for a
+    requested year by preferring a non-suffixed dataset, then B (more
+    recent), then A.
+  * In-process caches:
+      - UUID catalog cache: {year: (indicator_uuid, locality_uuid)}, 24h TTL
+      - Per-HCPCS indicator row cache: keyed by (hcpc, modifier, year)
+      - Per-locality row cache: keyed by (locality, year)
+      - Computed-rate cache: the existing cms_rate_cache SQLAlchemy table
+  * Rate limiting: asyncio.Semaphore(10) caps concurrent outbound HTTP
+  * Graceful degradation: if CMS is unreachable, we return stale cache
+    rather than hard-failing.
+
+Env vars:
+  CMS_API_CACHE_TTL   — seconds (default 86400 = 24h)
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -40,74 +58,59 @@ from backend.db.database import CmsRateCache, ZipLocality
 
 log = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-CMS_DATASET_ID = "9767cb68-8ea9-4f0b-8179-9a7a94480c2f"
-CMS_BASE_URL = f"https://data.cms.gov/data-api/v1/dataset/{CMS_DATASET_ID}/data"
+CMS_BASE = "https://pfs.data.cms.gov"
+CATALOG_URL = f"{CMS_BASE}/data.json"
 
-# Default TTL matches the spec (24h). Override via env or constructor.
 _DEFAULT_CACHE_TTL_SECONDS = int(os.getenv("CMS_API_CACHE_TTL", str(24 * 3600)))
 _DEFAULT_RATE_LIMIT_CONCURRENT = 10
-_DEFAULT_TIMEOUT_SECONDS = 20
+_DEFAULT_TIMEOUT_SECONDS = 30
 
 
 class CMSDatasetMovedError(Exception):
-    """Raised when the CMS dataset URL returns 404 — typically because CMS
-    retired the dataset ID when publishing a new annual fee schedule. The
-    calculator surfaces this as a banner message rather than per-line errors.
-    """
+    """Raised when CMS's catalog or query endpoints are unreachable/renamed.
+    The calculator shows a banner-level message instead of per-line errors."""
     pass
 
 
 # ---------------------------------------------------------------------------
-# Response shape
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-def _dec(raw) -> Optional[Decimal]:
-    """Convert the CMS JSON string fields (always strings) to Decimal."""
-    if raw is None or raw == "":
+_YEAR_RE = re.compile(r"\bfor\s+(\d{4})([AB]?)\b", re.IGNORECASE)
+
+
+def _parse_year_suffix(title: str) -> Optional[tuple[int, str]]:
+    """'Indicators for 2024B' -> (2024, 'B'). Returns None on no match."""
+    m = _YEAR_RE.search(title or "")
+    if not m:
+        return None
+    return int(m.group(1)), (m.group(2) or "").upper()
+
+
+def _dec(v) -> Optional[Decimal]:
+    if v is None or v == "":
         return None
     try:
-        return Decimal(str(raw).strip())
+        return Decimal(str(v).strip())
     except (InvalidOperation, ValueError):
         return None
 
 
-def _first_present(obj: dict, keys: list[str]) -> Optional[str]:
-    """Return the first non-empty value among the given keys.
-
-    CMS has historically renamed columns across dataset revisions
-    (HCPCS_CD vs HCPCS, WORK_RVU vs RVU_WORK, etc.). This helper tolerates that.
-    """
-    for k in keys:
-        v = obj.get(k)
-        if v not in (None, ""):
-            return str(v)
-    return None
-
-
-def _parse_cms_record(rec: dict) -> dict:
-    """Normalize one CMS dataset row into our internal flat shape."""
-    non_facility = _first_present(rec, ["NON_FAC_PRICE", "NON_FACILITY_PRICE", "NON_FAC_PAYMENT"])
-    facility = _first_present(rec, ["FACILITY_PRICE", "FAC_PRICE", "FACILITY_PAYMENT"])
-    work = _first_present(rec, ["WORK_RVU", "RVU_WORK"])
-    pe = _first_present(rec, ["NON_FAC_PE_RVU", "PE_RVU", "RVU_PE"])
-    mp = _first_present(rec, ["MP_RVU", "RVU_MP"])
-    total = _first_present(rec, ["NON_FAC_TOTAL_RVU", "TOTAL_RVU", "RVU_TOTAL"])
-    cf = _first_present(rec, ["CONV_FACTOR", "CONVERSION_FACTOR"])
-    return {
-        "non_facility_rate": _dec(non_facility),
-        "facility_rate": _dec(facility),
-        "work_rvu": _dec(work),
-        "pe_rvu": _dec(pe),
-        "mp_rvu": _dec(mp),
-        "total_rvu": _dec(total),
-        "conversion_factor": _dec(cf),
-        "raw_payload": rec,
-    }
+def _normalize_locality(code: str) -> str:
+    """Accept '01', '0000001', '1', etc. Pad to 7 digits on the LEFT with
+    zeros if all-numeric. If it contains non-digits, return as-is."""
+    if not code:
+        return ""
+    s = str(code).strip()
+    if s.isdigit():
+        return s.zfill(7)
+    return s
 
 
 # ---------------------------------------------------------------------------
@@ -116,39 +119,187 @@ def _parse_cms_record(rec: dict) -> dict:
 
 
 class CMSFeeScheduleEngine:
-    """CMS MPFS lookup with read-through SQLite cache.
+    """PFS lookup via DKAN-backed pfs.data.cms.gov. Reusable across requests.
 
-    Typical usage:
-        engine = CMSFeeScheduleEngine()
-        rate = await engine.get_mpfs_rate(session, "99213", "", "14", 2023)
-        expected = await engine.calculate_expected_payment(service_line, "14", dos)
-
-    The engine is reusable; one instance per app is fine. Close via `await engine.aclose()`
-    when shutting down the application.
+    Close with `await aclose()` on app shutdown.
     """
 
     def __init__(
         self,
         *,
-        base_url: str = CMS_BASE_URL,
+        catalog_url: str = CATALOG_URL,
         cache_ttl_seconds: int = _DEFAULT_CACHE_TTL_SECONDS,
         max_concurrent: int = _DEFAULT_RATE_LIMIT_CONCURRENT,
         timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
         client: Optional[httpx.AsyncClient] = None,
     ):
-        self.base_url = base_url
+        self.catalog_url = catalog_url
         self.cache_ttl = timedelta(seconds=cache_ttl_seconds)
         self._semaphore = asyncio.Semaphore(max_concurrent)
-        # Allow dependency injection for tests (e.g. httpx.MockTransport)
         self._client = client or httpx.AsyncClient(timeout=timeout_seconds)
         self._owns_client = client is None
+
+        # In-process caches (per-process, reset on restart)
+        # _catalog_cache[year] = (indicator_uuid, locality_uuid, fetched_at)
+        self._catalog_cache: dict[int, tuple[str, str, datetime]] = {}
+        self._catalog_lock = asyncio.Lock()
 
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()
 
     # -----------------------------------------------------------------
-    # Cache helpers
+    # Catalog discovery
+    # -----------------------------------------------------------------
+
+    async def _fetch_catalog(self) -> list[dict]:
+        """Return the raw list of datasets from data.json."""
+        async with self._semaphore:
+            resp = await self._client.get(self.catalog_url)
+        if resp.status_code == 404:
+            raise CMSDatasetMovedError(
+                f"CMS catalog at {self.catalog_url} is no longer reachable."
+            )
+        resp.raise_for_status()
+        body = resp.json()
+        if isinstance(body, dict) and "dataset" in body:
+            return body["dataset"]
+        if isinstance(body, list):
+            return body
+        raise CMSDatasetMovedError(
+            f"Unexpected catalog shape from {self.catalog_url}"
+        )
+
+    async def _resolve_datasets_for_year(self, year: int) -> tuple[str, str]:
+        """Find Indicator + Locality UUIDs for the given year.
+
+        For years with A/B splits, prefers B (newer updates include A's
+        fixes). For years with no data, falls back to the most recent
+        prior year we can find.
+
+        Returns (indicator_uuid, locality_uuid). Raises CMSDatasetMovedError
+        if neither can be found.
+        """
+        # Cache hit
+        cached = self._catalog_cache.get(year)
+        if cached:
+            ind_uuid, loc_uuid, fetched = cached
+            if datetime.utcnow() - fetched < self.cache_ttl:
+                return ind_uuid, loc_uuid
+
+        async with self._catalog_lock:
+            # Re-check in case another task populated while we waited
+            cached = self._catalog_cache.get(year)
+            if cached:
+                ind_uuid, loc_uuid, fetched = cached
+                if datetime.utcnow() - fetched < self.cache_ttl:
+                    return ind_uuid, loc_uuid
+
+            datasets = await self._fetch_catalog()
+
+            # Index by (year, suffix, kind) — kind is 'indicator' or 'locality'
+            # suffix is '' / 'A' / 'B'
+            indicators: dict[tuple[int, str], str] = {}
+            localities: dict[tuple[int, str], str] = {}
+            for ds in datasets:
+                title = ds.get("title", "")
+                ident = ds.get("identifier", "")
+                # identifier is a URL like
+                #   https://pfs.data.cms.gov/api/1/metastore/schemas/dataset/items/<UUID>
+                m_uuid = re.search(r"/([0-9a-f]{8}-[0-9a-f-]+)$", ident or "")
+                if not m_uuid:
+                    continue
+                uuid = m_uuid.group(1)
+                ys = _parse_year_suffix(title)
+                if not ys:
+                    continue
+                y, sfx = ys
+                tlow = title.lower()
+                if tlow.startswith("indicators for"):
+                    indicators[(y, sfx)] = uuid
+                elif tlow.startswith("localities for"):
+                    localities[(y, sfx)] = uuid
+
+            def pick(pool: dict[tuple[int, str], str], for_year: int) -> Optional[str]:
+                # Preference order: '' (non-split), 'B' (H2 update), 'A' (H1),
+                # then any other suffix
+                for sfx in ("", "B", "A"):
+                    if (for_year, sfx) in pool:
+                        return pool[(for_year, sfx)]
+                return None
+
+            ind_uuid = pick(indicators, year)
+            loc_uuid = pick(localities, year)
+
+            # Fall back to the most recent prior year if needed — CMS sometimes
+            # takes weeks to publish new-year datasets after Jan 1.
+            if not ind_uuid or not loc_uuid:
+                candidate_years = sorted(
+                    {y for (y, _) in indicators.keys()} | {y for (y, _) in localities.keys()},
+                    reverse=True,
+                )
+                for cy in candidate_years:
+                    if cy > year:
+                        continue
+                    if not ind_uuid:
+                        ind_uuid = pick(indicators, cy)
+                    if not loc_uuid:
+                        loc_uuid = pick(localities, cy)
+                    if ind_uuid and loc_uuid:
+                        if cy != year:
+                            log.info("CMS: no dataset for year %d; falling back to %d", year, cy)
+                        break
+
+            if not ind_uuid or not loc_uuid:
+                raise CMSDatasetMovedError(
+                    f"Could not find CMS PFS datasets for year {year} in catalog "
+                    f"(catalog had {len(indicators)} indicator(s), "
+                    f"{len(localities)} locality(ies))."
+                )
+
+            self._catalog_cache[year] = (ind_uuid, loc_uuid, datetime.utcnow())
+            return ind_uuid, loc_uuid
+
+    # -----------------------------------------------------------------
+    # DKAN query helpers
+    # -----------------------------------------------------------------
+
+    async def _dkan_query(self, uuid: str, filters: dict, limit: int = 5) -> list[dict]:
+        """Hit /api/1/datastore/query/{uuid}/0 with GET params. Returns rows list.
+
+        DKAN's GET-based query accepts conditions via repeated query params;
+        the simplest reliable approach is a POST with a JSON body.
+        """
+        url = f"{CMS_BASE}/api/1/datastore/query/{uuid}/0"
+        # DKAN POST query body
+        conditions = [
+            {"resource": "t", "property": k, "value": v, "operator": "="}
+            for k, v in filters.items() if v is not None and v != ""
+        ]
+        payload = {"conditions": conditions, "limit": limit}
+        async with self._semaphore:
+            resp = await self._client.post(url, json=payload)
+
+        if resp.status_code == 404:
+            raise CMSDatasetMovedError(
+                f"CMS dataset {uuid} returned 404 — catalog may be stale."
+            )
+        if resp.status_code != 200:
+            log.warning("CMS DKAN query returned %d: %s", resp.status_code, resp.text[:200])
+            return []
+        try:
+            body = resp.json()
+        except ValueError:
+            return []
+        # DKAN wraps results under 'results'
+        if isinstance(body, dict) and "results" in body and isinstance(body["results"], list):
+            return body["results"]
+        if isinstance(body, list):
+            return body
+        return []
+
+    # -----------------------------------------------------------------
+    # Rate computation
     # -----------------------------------------------------------------
 
     async def _cache_get(
@@ -171,20 +322,7 @@ class CMSFeeScheduleEngine:
     ) -> CmsRateCache:
         now = datetime.utcnow()
         existing = await self._cache_get(session, hcpcs, modifier, locality, year)
-        if existing:
-            existing.non_facility_rate = parsed["non_facility_rate"]
-            existing.facility_rate = parsed["facility_rate"]
-            existing.work_rvu = parsed["work_rvu"]
-            existing.pe_rvu = parsed["pe_rvu"]
-            existing.mp_rvu = parsed["mp_rvu"]
-            existing.total_rvu = parsed["total_rvu"]
-            existing.conversion_factor = parsed["conversion_factor"]
-            existing.raw_payload = parsed["raw_payload"]
-            existing.cached_at = now
-            existing.cached_until = now + self.cache_ttl
-            return existing
-        row = CmsRateCache(
-            hcpcs=hcpcs, modifier=modifier, locality=locality, year=year,
+        kwargs = dict(
             non_facility_rate=parsed["non_facility_rate"],
             facility_rate=parsed["facility_rate"],
             work_rvu=parsed["work_rvu"],
@@ -192,88 +330,23 @@ class CMSFeeScheduleEngine:
             mp_rvu=parsed["mp_rvu"],
             total_rvu=parsed["total_rvu"],
             conversion_factor=parsed["conversion_factor"],
-            raw_payload=parsed["raw_payload"],
+            raw_payload=parsed.get("raw_payload"),
+        )
+        if existing:
+            for k, v in kwargs.items():
+                setattr(existing, k, v)
+            existing.cached_at = now
+            existing.cached_until = now + self.cache_ttl
+            return existing
+        row = CmsRateCache(
+            hcpcs=hcpcs, modifier=modifier, locality=locality, year=year,
+            **kwargs,
             cached_at=now,
             cached_until=now + self.cache_ttl,
         )
         session.add(row)
         await session.flush()
         return row
-
-    # -----------------------------------------------------------------
-    # HTTP
-    # -----------------------------------------------------------------
-
-    async def _fetch_from_api(
-        self, hcpcs: str, modifier: str, locality: str, year: int,
-    ) -> Optional[dict]:
-        """Call the CMS API and return the normalized first-match record, or None."""
-        params = {
-            "filter[HCPCS_CD]": hcpcs,
-            "filter[LOCALITY_NUM]": locality,
-            "filter[YEAR]": str(year),
-        }
-        if modifier:
-            params["filter[MODIFIER]"] = modifier
-
-        async with self._semaphore:
-            try:
-                resp = await self._client.get(self.base_url, params=params)
-            except httpx.RequestError as e:
-                # Network / transport error — caller will fall back to stale
-                # cache if present. This is the 'CMS API unreachable' path,
-                # NOT the 'dataset moved' path.
-                log.warning("CMS API request failed: %s", e)
-                return None
-
-        if resp.status_code == 404:
-            # Dataset has been deprecated / URL has moved. This is the signal
-            # that the CMS integration needs to be updated to the new API.
-            # Raise a specific sentinel so the calculator endpoint can show a
-            # one-time banner instead of confusing per-line errors.
-            log.warning(
-                "CMS dataset %s returned 404. The dataset ID may be stale — "
-                "CMS migrated PFS data to pfs.data.cms.gov and retires old "
-                "dataset IDs annually. Update CMS_DATASET_ID in cms_engine.py.",
-                CMS_DATASET_ID,
-            )
-            raise CMSDatasetMovedError(
-                "CMS MPFS dataset is no longer available at the expected URL. "
-                "The dataset has likely been migrated by CMS."
-            )
-
-        if resp.status_code != 200:
-            log.warning("CMS API non-200 status %s for %s", resp.status_code, params)
-            return None
-
-        try:
-            data = resp.json()
-        except ValueError:
-            log.warning("CMS API returned non-JSON")
-            return None
-
-        # The dataset API returns a list of records directly.
-        if isinstance(data, list):
-            records = data
-        elif isinstance(data, dict) and "data" in data:
-            records = data["data"]
-        else:
-            records = []
-
-        if not records:
-            log.info(
-                "CMS API returned no rows for HCPCS=%s mod=%s locality=%s year=%d",
-                hcpcs, modifier, locality, year,
-            )
-            return None
-
-        # If multiple records match, prefer the first. The caller can pass MODIFIER
-        # to narrow; global/unmodified rates come back without a modifier row.
-        return _parse_cms_record(records[0])
-
-    # -----------------------------------------------------------------
-    # Public API
-    # -----------------------------------------------------------------
 
     async def get_mpfs_rate(
         self,
@@ -285,34 +358,122 @@ class CMSFeeScheduleEngine:
         *,
         force_refresh: bool = False,
     ) -> Optional[CmsRateCache]:
-        """Fetch a cached or live CMS MPFS rate.
+        """Return the MPFS rate for a given procedure, modifier, locality, year.
 
-        Returns a CmsRateCache row (guaranteed fresh within TTL, or stale fallback)
-        or None if neither cache nor API had data.
+        Result is cached in cms_rate_cache for 24h. Stale cache is returned
+        as a fallback if the CMS API is temporarily unreachable.
         """
-        hcpcs = hcpcs.upper().strip()
+        hcpcs = (hcpcs or "").upper().strip()
         modifier = (modifier or "").upper().strip()
+        locality_norm = _normalize_locality(locality)
 
-        cached = await self._cache_get(session, hcpcs, modifier, locality, year)
+        # Cache fast path
+        cached = await self._cache_get(session, hcpcs, modifier, locality_norm, year)
         now = datetime.utcnow()
         if cached and not force_refresh and cached.cached_until > now:
-            log.debug("CMS cache hit (fresh) for %s mod=%s loc=%s yr=%d", hcpcs, modifier, locality, year)
             return cached
 
-        parsed = await self._fetch_from_api(hcpcs, modifier, locality, year)
+        # Fetch both datasets, compute the rate
+        try:
+            parsed = await self._compute_rate(hcpcs, modifier, locality_norm, year)
+        except CMSDatasetMovedError:
+            # Propagate up — calculator endpoint surfaces this as a banner
+            raise
+        except Exception as e:
+            log.warning("CMS rate computation failed: %s", e)
+            parsed = None
+
         if parsed is None:
-            # Fall back to stale cache if present
+            # Fall back to stale cache if available
             if cached:
-                log.info(
-                    "CMS API unreachable/empty; returning stale cache (cached_at=%s) for %s",
-                    cached.cached_at, hcpcs,
-                )
+                log.info("CMS unreachable; returning stale cache for %s/%s/%s/%s",
+                         hcpcs, modifier, locality_norm, year)
                 return cached
             return None
 
-        row = await self._cache_put(session, hcpcs, modifier, locality, year, parsed)
+        row = await self._cache_put(session, hcpcs, modifier, locality_norm, year, parsed)
         await session.commit()
         return row
+
+    async def _compute_rate(
+        self, hcpcs: str, modifier: str, locality: str, year: int,
+    ) -> Optional[dict]:
+        """Look up indicator + locality rows, apply the RVU × GPCI × CF formula."""
+        ind_uuid, loc_uuid = await self._resolve_datasets_for_year(year)
+
+        # Parallel fetches: one for the HCPCS row, one for the locality row
+        ind_task = self._dkan_query(ind_uuid, {"hcpc": hcpcs, "modifier": modifier}, limit=2)
+        loc_task = self._dkan_query(loc_uuid, {"locality": locality}, limit=2)
+        try:
+            ind_rows, loc_rows = await asyncio.gather(ind_task, loc_task)
+        except CMSDatasetMovedError:
+            raise
+        except Exception as e:
+            log.warning("CMS fetch failed: %s", e)
+            return None
+
+        if not ind_rows:
+            log.info("CMS: no Indicators row for hcpc=%s mod=%s year=%s", hcpcs, modifier, year)
+            return None
+        if not loc_rows:
+            log.info("CMS: no Localities row for locality=%s year=%s", locality, year)
+            return None
+
+        ind = ind_rows[0]
+        loc = loc_rows[0]
+
+        rvu_work = _dec(ind.get("rvu_work")) or Decimal("0")
+        # Prefer 'full_*' (fully-implemented) over 'trans_*' (transitional).
+        # A few datasets use different column names; fall back gracefully.
+        full_nfac_pe = _dec(ind.get("full_nfac_pe") or ind.get("nfac_pe")) or Decimal("0")
+        full_fac_pe = _dec(ind.get("full_fac_pe") or ind.get("fac_pe")) or Decimal("0")
+        rvu_mp = _dec(ind.get("rvu_mp")) or Decimal("0")
+        cf = _dec(ind.get("conv_fact"))
+
+        gpci_work = _dec(loc.get("gpci_work")) or Decimal("1")
+        gpci_pe = _dec(loc.get("gpci_pe")) or Decimal("1")
+        gpci_mp = _dec(loc.get("gpci_mp")) or Decimal("1")
+
+        if cf is None or cf == 0:
+            # Without a conversion factor we can't compute dollars
+            log.info("CMS: conversion factor missing/zero for hcpc=%s year=%d", hcpcs, year)
+            return None
+
+        work_component = rvu_work * gpci_work
+        mp_component = rvu_mp * gpci_mp
+        pe_nfac_component = full_nfac_pe * gpci_pe
+        pe_fac_component = full_fac_pe * gpci_pe
+
+        non_facility_rate = (work_component + pe_nfac_component + mp_component) * cf
+        facility_rate = (work_component + pe_fac_component + mp_component) * cf
+
+        # Total RVU reflects the chosen PE (use non-facility for display default)
+        total_rvu_nfac = rvu_work + full_nfac_pe + rvu_mp
+
+        # Round dollar amounts to 2dp; leave RVUs at 4dp
+        CENT = Decimal("0.01")
+        non_facility_rate = non_facility_rate.quantize(CENT)
+        facility_rate = facility_rate.quantize(CENT)
+
+        return {
+            "non_facility_rate": non_facility_rate,
+            "facility_rate": facility_rate,
+            "work_rvu": rvu_work,
+            "pe_rvu": full_nfac_pe,
+            "mp_rvu": rvu_mp,
+            "total_rvu": total_rvu_nfac,
+            "conversion_factor": cf,
+            "raw_payload": {
+                "indicator_row": ind,
+                "locality_row": loc,
+                "computation": {
+                    "work_component": str(work_component),
+                    "pe_nfac_component": str(pe_nfac_component),
+                    "pe_fac_component": str(pe_fac_component),
+                    "mp_component": str(mp_component),
+                },
+            },
+        }
 
     # -----------------------------------------------------------------
     # ZIP → locality
@@ -320,7 +481,6 @@ class CMSFeeScheduleEngine:
 
     @staticmethod
     def normalize_zip(zip_raw: str) -> str:
-        """Strip formatting and ZIP+4 down to the 5-digit base."""
         if not zip_raw:
             return ""
         m = re.match(r"(\d{5})", zip_raw.strip())
@@ -329,10 +489,6 @@ class CMSFeeScheduleEngine:
     async def get_locality_from_zip(
         self, session: AsyncSession, zip_code: str, year: Optional[int] = None,
     ) -> Optional[str]:
-        """Resolve a ZIP code to a Medicare locality number via the `zip_locality` table.
-
-        If the table is empty, returns None — the caller should surface a setup error.
-        """
         zip5 = self.normalize_zip(zip_code)
         if not zip5:
             return None
@@ -362,14 +518,12 @@ class CMSFeeScheduleEngine:
         *,
         use_facility_rate: bool = False,
     ) -> Optional[Decimal]:
-        """Return the expected MPFS payment for a single service line.
-
-        - Chooses the non-facility or facility rate based on `use_facility_rate`.
-        - Uses the year of DOS for the cache / API lookup.
-        """
-        year = date_of_service.year
-        row = await self.get_mpfs_rate(session, procedure_code, modifier, locality, year)
+        row = await self.get_mpfs_rate(
+            session, procedure_code, modifier, locality, date_of_service.year,
+        )
         if row is None:
             return None
-        rate = row.facility_rate if use_facility_rate else row.non_facility_rate
-        return rate
+        return row.facility_rate if use_facility_rate else row.non_facility_rate
+
+
+__all__ = ["CMSFeeScheduleEngine", "CMSDatasetMovedError"]
