@@ -201,15 +201,21 @@ class CMSFeeScheduleEngine:
             # suffix is '' / 'A' / 'B'
             indicators: dict[tuple[int, str], str] = {}
             localities: dict[tuple[int, str], str] = {}
+            # Standard UUID (8-4-4-4-12 hex). Accept the UUID anywhere in the
+            # identifier string — could be a bare UUID, a URL path ending in
+            # the UUID, or embedded in some other way depending on catalog shape.
+            uuid_re = re.compile(
+                r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+                re.IGNORECASE,
+            )
             for ds in datasets:
                 title = ds.get("title", "")
-                ident = ds.get("identifier", "")
-                # identifier is a URL like
-                #   https://pfs.data.cms.gov/api/1/metastore/schemas/dataset/items/<UUID>
-                m_uuid = re.search(r"/([0-9a-f]{8}-[0-9a-f-]+)$", ident or "")
+                # Try 'identifier' first, then 'id' as a fallback
+                ident = ds.get("identifier") or ds.get("id") or ""
+                m_uuid = uuid_re.search(ident)
                 if not m_uuid:
                     continue
-                uuid = m_uuid.group(1)
+                uuid = m_uuid.group(1).lower()
                 ys = _parse_year_suffix(title)
                 if not ys:
                     continue
@@ -219,6 +225,11 @@ class CMSFeeScheduleEngine:
                     indicators[(y, sfx)] = uuid
                 elif tlow.startswith("localities for"):
                     localities[(y, sfx)] = uuid
+
+            log.info(
+                "CMS catalog: parsed %d indicator + %d locality datasets",
+                len(indicators), len(localities),
+            )
 
             def pick(pool: dict[tuple[int, str], str], for_year: int) -> Optional[str]:
                 # Preference order: '' (non-split), 'B' (H2 update), 'A' (H1),
