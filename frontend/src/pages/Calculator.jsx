@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { calculateRate, extractErrorMessage } from '../services/api.js';
 import { fmtCurrency, fmtPercent, varianceSign } from '../utils/format.js';
+import LocalitySelect from '../components/LocalitySelect.jsx';
 
 // Manual CPT/ICD entry calculator with full math-chain transparency.
 // Each APG line shows: EAPG assignment → weight → base rate → modifiers →
@@ -137,17 +138,13 @@ export default function Calculator() {
         {/* CMS-specific row */}
         {(target === 'cms' || target === 'both') && (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 border-t border-slate-200 pt-4">
-            <div>
-              <label className="label" htmlFor="loc">CMS locality (optional)</label>
-              <input
-                id="loc" className="input"
-                placeholder="Falls back to provider config"
-                value={cmsLocality} onChange={(e) => setCmsLocality(e.target.value)}
-              />
-              <p className="text-xs text-slate-500 mt-1">
-                e.g. <code>01</code> for NYC.
-              </p>
-            </div>
+            <LocalitySelect
+              year={dos ? parseInt(dos.slice(0, 4), 10) : new Date().getFullYear()}
+              value={cmsLocality}
+              onChange={setCmsLocality}
+              allowProviderDefault
+              id="cms-locality"
+            />
             <div className="md:col-span-2 space-y-2">
               <label className="label block">CMS options</label>
               <label className="inline-flex items-center gap-2 text-sm">

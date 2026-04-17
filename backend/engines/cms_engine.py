@@ -103,14 +103,16 @@ def _dec(v) -> Optional[Decimal]:
 
 
 def _normalize_locality(code: str) -> str:
-    """Accept '01', '0000001', '1', etc. Pad to 7 digits on the LEFT with
-    zeros if all-numeric. If it contains non-digits, return as-is."""
+    """Keep the locality code as provided (CMS uses 7-digit MAC-locality
+    format like '1320201' for Manhattan). We only trim whitespace and
+    coerce to string. Historically this padded to 7 digits, but real
+    locality codes are the literal strings from the CMS Localities
+    dataset — the dropdown in the UI now supplies the exact value, so
+    no padding heuristics are needed.
+    """
     if not code:
         return ""
-    s = str(code).strip()
-    if s.isdigit():
-        return s.zfill(7)
-    return s
+    return str(code).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +145,10 @@ class CMSFeeScheduleEngine:
         # _catalog_cache[year] = (indicator_uuid, locality_uuid, fetched_at)
         self._catalog_cache: dict[int, tuple[str, str, datetime]] = {}
         self._catalog_lock = asyncio.Lock()
+        # _locality_list_cache[year] = (list_of_rows, fetched_at)
+        # Cached because it's looked up on every page-load of the
+        # Calculator / Settings locality dropdown.
+        self._locality_list_cache: dict[int, tuple[list[dict], datetime]] = {}
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -270,6 +276,59 @@ class CMSFeeScheduleEngine:
 
             self._catalog_cache[year] = (ind_uuid, loc_uuid, datetime.utcnow())
             return ind_uuid, loc_uuid
+
+    # -----------------------------------------------------------------
+    # Locality listing (for UI dropdowns)
+    # -----------------------------------------------------------------
+
+    async def list_localities(self, year: int) -> list[dict]:
+        """Return all localities for a given year, sorted by region then name.
+
+        Each entry contains:
+            locality        — 7-digit code (e.g. '1320201' for Manhattan)
+            description     — human-readable (e.g. 'MANHATTAN')
+            mac             — Medicare Admin Contractor number
+            mac_description — MAC region name (for grouping, e.g. 'NATIONAL')
+
+        Cached in-memory for 24h per year. The CMS list has ~110 rows so one
+        request is plenty.
+        """
+        cached = self._locality_list_cache.get(year)
+        if cached:
+            rows, fetched = cached
+            if datetime.utcnow() - fetched < self.cache_ttl:
+                return rows
+
+        try:
+            _, loc_uuid = await self._resolve_datasets_for_year(year)
+        except CMSDatasetMovedError:
+            return []
+
+        try:
+            raw_rows = await self._dkan_query(loc_uuid, {}, limit=500)
+        except CMSDatasetMovedError:
+            return []
+
+        out = []
+        for r in raw_rows:
+            loc = (r.get("locality") or "").strip()
+            if not loc:
+                continue
+            out.append({
+                "locality": loc,
+                "description": (r.get("loc_description") or "").strip(),
+                "mac": (r.get("mac") or "").strip(),
+                "mac_description": (r.get("mac_description") or "").strip(),
+            })
+        # Sort: by MAC region, then description. National first (it's the
+        # catch-all default).
+        def sort_key(row):
+            is_national = row["mac_description"].upper() == "NATIONAL"
+            return (0 if is_national else 1, row["mac_description"], row["description"])
+        out.sort(key=sort_key)
+
+        self._locality_list_cache[year] = (out, datetime.utcnow())
+        return out
 
     # -----------------------------------------------------------------
     # DKAN query helpers

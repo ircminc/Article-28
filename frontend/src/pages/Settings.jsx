@@ -10,6 +10,7 @@ import {
   upsertProvider,
 } from '../services/api.js';
 import { useAuth } from '../auth/AuthContext.jsx';
+import LocalitySelect from '../components/LocalitySelect.jsx';
 
 // Lists mirror the reference-data categorical domains. Keep them in sync with
 // the backend: peer_group values must match rows in apg_base_rates.peer_group,
@@ -249,14 +250,17 @@ export default function Settings() {
           )}
 
           <div>
-            <label className="label" htmlFor="cms_locality">CMS locality (for 835P)</label>
-            <input
+            <LocalitySelect
+              year={new Date().getFullYear()}
+              value={form.cms_locality || ''}
+              onChange={(v) => handleChange('cms_locality', v)}
+              allowProviderDefault={false}
               id="cms_locality"
-              className="input"
-              value={form.cms_locality}
-              onChange={(e) => handleChange('cms_locality', e.target.value)}
-              placeholder="e.g. 01"
             />
+            <p className="text-xs text-slate-500 mt-1">
+              Default Medicare locality for this provider (used by the Rate
+              Calculator and 835P analysis). Pick by region name.
+            </p>
           </div>
 
           <div>

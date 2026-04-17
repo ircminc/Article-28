@@ -881,6 +881,27 @@ async def lookup_cms_rate(
     }
 
 
+@app.get("/api/reference/cms-localities")
+async def list_cms_localities(
+    current: CurrentUser,
+    year: int = Query(..., ge=2000, le=2100,
+                      description="Calendar year of the CMS fee schedule"),
+) -> dict:
+    """List all CMS Medicare localities for a given year.
+
+    Used by the UI to populate locality dropdowns so users pick by name
+    ('MANHATTAN') instead of having to remember the 7-digit MAC-locality code
+    ('1320201'). Cached in the engine for 24h per year.
+    """
+    cms = get_cms_engine()
+    rows = await cms.list_localities(year)
+    return {
+        "year": year,
+        "count": len(rows),
+        "localities": rows,
+    }
+
+
 @app.get("/api/reference/zip-locality/{zip_code}")
 async def lookup_zip_locality(
     zip_code: str,

@@ -378,11 +378,51 @@ async def test_zip_to_locality_lookup(session):
 # ---------------------------------------------------------------------------
 
 
-def test_locality_normalization_pads_short_numeric():
+@pytest.mark.asyncio
+async def test_list_localities_sorted_national_first(session):
+    """The locality list for the UI dropdown should put NATIONAL first,
+    then other regions alphabetically."""
+    sample_rows = [
+        {"locality": "1320201", "loc_description": "MANHATTAN",
+         "mac": "13202", "mac_description": "NEW YORK"},
+        {"locality": "0000000", "loc_description": "NATIONAL",
+         "mac": "00000", "mac_description": "NATIONAL"},
+        {"locality": "0111205", "loc_description": "SAN FRANCISCO-OAKLAND",
+         "mac": "01112", "mac_description": "NORTHERN CALIFORNIA"},
+        {"locality": "1329204", "loc_description": "QUEENS",
+         "mac": "13292", "mac_description": "NEW YORK"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "data.json" in str(request.url):
+            return _catalog_response()
+        # Localities query returns all the sample rows
+        return _dkan_response(sample_rows)
+
+    eng = _make_engine(handler)
+    try:
+        rows = await eng.list_localities(2025)
+    finally:
+        await eng.aclose()
+
+    # NATIONAL comes first
+    assert rows[0]["mac_description"] == "NATIONAL"
+    # Then NEW YORK (alphabetically before NORTHERN CALIFORNIA)
+    ny_rows = [r for r in rows if r["mac_description"] == "NEW YORK"]
+    assert ny_rows[0]["description"] == "MANHATTAN"  # sorts alphabetically
+    assert ny_rows[1]["description"] == "QUEENS"
+    # Each row has the required keys
+    for r in rows:
+        assert set(r.keys()) == {"locality", "description", "mac", "mac_description"}
+
+
+def test_locality_normalization_passthrough():
+    """The locality dropdown now supplies exact CMS codes, so normalization
+    is a simple trim — no zero-padding heuristics (the previous approach of
+    padding '01' to '0000001' was wrong: Manhattan is '1320201' not '0000001')."""
     from backend.engines.cms_engine import _normalize_locality
-    assert _normalize_locality("01") == "0000001"
-    assert _normalize_locality("1") == "0000001"
-    assert _normalize_locality("0100001") == "0100001"
+    assert _normalize_locality("1320201") == "1320201"
+    assert _normalize_locality(" 1329204 ") == "1329204"
+    assert _normalize_locality("0000000") == "0000000"
     assert _normalize_locality("") == ""
-    # Non-numeric left alone
-    assert _normalize_locality("ABC123") == "ABC123"
+    assert _normalize_locality(None) == ""

@@ -93,6 +93,15 @@ export async function clearCmsCache() {
   return data;
 }
 
+// List CMS Medicare localities for a year — used to populate dropdowns
+// instead of forcing users to type 7-digit MAC-locality codes.
+export async function listCmsLocalities(year) {
+  const { data } = await apiClient.get('/api/reference/cms-localities', {
+    params: { year },
+  });
+  return data;
+}
+
 // Admin: upload a new NYS DOH workbook to reload APG reference data
 export async function reloadReferenceData(file) {
   const form = new FormData();
