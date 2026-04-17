@@ -113,6 +113,19 @@ export async function reloadReferenceData(file) {
   return data;
 }
 
+// Admin: upload NYS DOH's DTC base-rates file (the periodic .xls inventory).
+// Replaces only the DTC rows in apg_base_rates — leaves hospital rates and
+// everything else untouched.
+export async function reloadDtcBaseRates(file) {
+  const form = new FormData();
+  form.append('file', file);
+  const { data } = await apiClient.post('/api/admin/reload-dtc-rates', form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 60_000,   // much smaller file than the full workbook
+  });
+  return data;
+}
+
 // ---------------------------------------------------------------------------
 // Uploads
 // ---------------------------------------------------------------------------

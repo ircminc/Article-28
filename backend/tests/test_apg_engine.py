@@ -38,9 +38,13 @@ FIXTURE = Path(__file__).parent / "fixtures" / "sample_835i.edi"
 @pytest_asyncio.fixture()
 async def session():
     async with async_session() as s:
-        # Skip if reference data not loaded
-        cnt = await s.execute(select(func.count()).select_from(HcpcsToEapg))
-        if cnt.scalar_one() == 0:
+        # Skip if any required reference data is missing (HCPCS or base rates).
+        # Defensive: other tests that mutate apg_base_rates might leave it empty,
+        # in which case we'd rather skip than give misleading "engine broken" failures.
+        from backend.db.database import ApgBaseRate
+        hcpcs_cnt = (await s.execute(select(func.count()).select_from(HcpcsToEapg))).scalar_one()
+        rate_cnt = (await s.execute(select(func.count()).select_from(ApgBaseRate))).scalar_one()
+        if hcpcs_cnt == 0 or rate_cnt == 0:
             pytest.skip("Reference data not loaded. Run `python -m backend.db.init_db --workbook <path>` first.")
         yield s
 

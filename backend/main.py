@@ -660,6 +660,56 @@ async def clear_cms_cache(
     return {"cached_rates_cleared": n}
 
 
+@app.post("/api/admin/reload-dtc-rates")
+async def reload_dtc_base_rates(
+    current: RequireAdmin,
+    request: Request,
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Upload NYS DOH's DTC base-rates file and replace only the DTC rows
+    in apg_base_rates.
+
+    Admin only. Accepts .xls (the format NYS DOH actually publishes) and
+    .xlsx. Preserves hospital base rates, HCPCS/ICD-10 crosswalks, APG
+    weights, provider_county, users, claims, and the audit log.
+    """
+    from backend.db.init_dtc_rates import load_dtc_rates_from_bytes
+
+    if not (file.filename or "").lower().endswith((".xls", ".xlsx", ".xlsm")):
+        raise HTTPException(
+            400, "File must be an Excel workbook (.xls, .xlsx, or .xlsm)"
+        )
+
+    file_bytes = await file.read()
+    try:
+        deleted, inserted = await load_dtc_rates_from_bytes(
+            session, file_bytes, filename=file.filename,
+        )
+    except ValueError as e:
+        raise HTTPException(400, f"Unable to parse workbook: {e}")
+    except Exception as e:
+        raise HTTPException(500, f"Loader failed: {e}")
+
+    await audit(
+        session, user=current, request=request,
+        action="dtc_rates.reload",
+        resource=file.filename,
+        details={
+            "file_size": len(file_bytes),
+            "rows_deleted": deleted,
+            "rows_inserted": inserted,
+        },
+    )
+    await session.commit()
+    return {
+        "ok": True,
+        "filename": file.filename,
+        "rows_deleted": deleted,
+        "rows_inserted": inserted,
+    }
+
+
 @app.post("/api/admin/reload-reference-data")
 async def reload_reference_data(
     current: RequireAdmin,

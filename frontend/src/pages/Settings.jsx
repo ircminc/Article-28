@@ -6,6 +6,7 @@ import {
   clearCmsCache,
   extractErrorMessage,
   getProvider,
+  reloadDtcBaseRates,
   reloadReferenceData,
   upsertProvider,
 } from '../services/api.js';
@@ -372,6 +373,9 @@ function ReferenceDataTools({ queryClient, isAdmin }) {
         </div>
       </div>
 
+      {/* DTC base rates (partial update) */}
+      {isAdmin && <DtcBaseRatesUpload queryClient={queryClient} />}
+
       {/* APG workbook upload (admin only) */}
       {isAdmin && (
         <div className="border-t border-slate-200 dark:border-slate-700 pt-4">
@@ -430,6 +434,75 @@ function ReferenceDataTools({ queryClient, isAdmin }) {
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// DTC base-rates upload (partial update — only source='dtc' rows touched)
+// ---------------------------------------------------------------------------
+
+function DtcBaseRatesUpload({ queryClient }) {
+  const [file, setFile] = useState(null);
+  const mut = useMutation({
+    mutationFn: (f) => reloadDtcBaseRates(f),
+    onSuccess: () => {
+      // Any APG-dependent cache should refresh
+      queryClient.invalidateQueries({ queryKey: ['analytics'] });
+      queryClient.invalidateQueries({ queryKey: ['claims'] });
+      setFile(null);
+    },
+  });
+
+  return (
+    <div className="border-t border-slate-200 dark:border-slate-700 pt-4">
+      <h3 className="text-sm font-medium text-slate-700 dark:text-slate-300">
+        DTC base rates (Freestanding clinics & ambulatory surgery)
+      </h3>
+      <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+        When NYS DOH publishes an updated Freestanding APG base-rate inventory
+        (<code>dtc_base_rates_inv.xls</code> on their website), upload it here
+        to refresh just the DTC peer-group rates (Clinic*, Amb Surg, SBHC,
+        Renal, Academic Dental, etc.). Hospital base rates, HCPCS/ICD-10
+        crosswalks, APG weights, and all other reference data are left
+        untouched.
+      </p>
+      <div className="mt-3 flex flex-wrap items-center gap-3">
+        <label className="btn-secondary cursor-pointer">
+          <UploadIcon className="w-4 h-4" aria-hidden />
+          {file ? file.name : 'Choose DTC rates file (.xls or .xlsx)'}
+          <input
+            type="file"
+            accept=".xls,.xlsx,.xlsm"
+            className="hidden"
+            onChange={(e) => setFile(e.target.files[0] || null)}
+          />
+        </label>
+        {file && (
+          <button
+            type="button"
+            className="btn-primary"
+            onClick={() => mut.mutate(file)}
+            disabled={mut.isPending}
+          >
+            {mut.isPending ? 'Uploading…' : 'Upload & replace DTC rates'}
+          </button>
+        )}
+        {mut.isSuccess && (
+          <span className="pill-success">
+            <CheckCircle2 className="w-3 h-3" aria-hidden />
+            Replaced {mut.data?.rows_deleted ?? 0} old row(s) with
+            {' '}{mut.data?.rows_inserted ?? 0} new row(s).
+          </span>
+        )}
+        {mut.isError && (
+          <span className="pill-danger">
+            <AlertCircle className="w-3 h-3" aria-hidden />
+            {extractErrorMessage(mut.error)}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 
 // ---------------------------------------------------------------------------
 // Danger zone — clear all uploaded claims
