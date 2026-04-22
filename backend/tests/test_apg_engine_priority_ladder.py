@@ -124,7 +124,7 @@ async def ladder_session():
 
         # One shared APG weight for FAKE_APG so the priority-3 path has a weight
         s.add(ApgWeight(
-            apg=FAKE_APG, apg_desc="Test EAPG",
+            apg=FAKE_APG, apg_description="Test EAPG",
             effective_date=date(2020, 1, 1),
             weight=Decimal("1.0000"),
             is_final_rate=False,
