@@ -218,6 +218,7 @@ async def _load_apg_weights(session: AsyncSession, rows: list[list]) -> int:
                 apg=apg, apg_description=desc, effective_date=eff_date,
                 weight=w, is_final_rate=False, year_rate=None,
             ))
+            count += 1
 
         fr = _to_decimal(row[final_rate_idx]) if final_rate_idx is not None and final_rate_idx < len(row) else None
         yr = _to_int(row[year_rate_idx]) if year_rate_idx is not None and year_rate_idx < len(row) else None
@@ -226,7 +227,7 @@ async def _load_apg_weights(session: AsyncSession, rows: list[list]) -> int:
                 apg=apg, apg_description=desc, effective_date=_SENTINEL_FINAL_DATE,
                 weight=fr, is_final_rate=True, year_rate=yr,
             ))
-        count += 1
+            count += 1
         if len(batch) >= 2000:
             session.add_all(batch); await session.flush(); batch.clear()
     if batch:
