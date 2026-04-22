@@ -231,27 +231,41 @@ async def test_priority1_fee_schedule_caps_at_max_units(ladder_session):
     assert ld.expected_payment == Decimal("300.00")
 
 
+def _round2(x: Decimal) -> Decimal:
+    """Round to cents the same way the engine does, so we compare apples to apples."""
+    from decimal import ROUND_HALF_UP
+    return x.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
 @pytest.mark.asyncio
 async def test_priority2_px_weight_overrides_apg_weight(ladder_session):
     """A HCPCS with a Px-based weight uses base_rate × px_weight, not the
-    APG-level weight. Fee Schedule is NOT present for this code."""
+    APG-level weight. Fee Schedule is NOT present for this code.
+
+    Expected payment is computed from the resolved base rate so the test
+    is robust regardless of whether the dev DB already has a Clinic*
+    Downstate DTC rate or relies on the fixture's seeded fallback.
+    """
     engine_ = APGEngine()
     result = await engine_.calculate(ladder_session, _claim(PX_CODE), _provider())
     ld = result.line_details[0]
-    # base_rate (200) * px_weight (3.5) = 700.00  — not 200 * 1.0 = 200
-    assert ld.expected_payment == Decimal("700.00")
+    # Px weight = 3.5. Expected = base_rate × 3.5 (not × 1.0 which is the APG weight)
+    expected = _round2(result.base_rate_applied * Decimal("3.5"))
+    assert ld.expected_payment == expected
+    # And sanity-check it's different from what the APG fallback would have paid
+    assert ld.expected_payment != _round2(result.base_rate_applied * Decimal("1.0"))
     assert any("Px-Based Weight applied" in n for n in ld.notes)
 
 
 @pytest.mark.asyncio
 async def test_priority3_apg_weight_fallback(ladder_session):
     """With no Fee Schedule or Px weight hit, pricing falls back to the
-    classic APG formula: base_rate × APG weight."""
+    classic APG formula: base_rate × APG weight (1.0 in this fixture)."""
     engine_ = APGEngine()
     result = await engine_.calculate(ladder_session, _claim(APG_CODE), _provider())
     ld = result.line_details[0]
-    # base_rate (200) * APG weight (1.0) = 200.00
-    assert ld.expected_payment == Decimal("200.00")
+    expected = _round2(result.base_rate_applied * Decimal("1.0"))
+    assert ld.expected_payment == expected
     # No fee-schedule or px notes
     assert not any("Fee Schedule" in n for n in ld.notes)
     assert not any("Px-Based Weight" in n for n in ld.notes)
