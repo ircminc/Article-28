@@ -45,8 +45,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.db.database import (
     ApgBaseRate,
     ApgWeight,
+    FeeScheduleItem,
     HcpcsToEapg,
     Icd10ToEapg,
+    PxBasedWeight,
     ProviderConfig,
     ProviderCounty,
 )
@@ -97,6 +99,9 @@ class _LineContext:
     discounted: bool = False
     u6_applied: bool = False
     denied: bool = False
+    fee_scheduled: bool = False     # priority #1: flat-rate fee schedule applied
+    px_weight_applied: bool = False # priority #2: Px-based weight override applied
+    eapg_type_raw: Optional[str] = None  # raw v3.18 type string for UI display
     notes: list[str] = None
 
     def __post_init__(self):
@@ -210,6 +215,44 @@ class APGEngine:
         res = await session.execute(stmt)
         return res.scalar_one_or_none()
 
+    async def lookup_fee_schedule(
+        self, session: AsyncSession, hcpcs: str, dos: date
+    ) -> Optional[FeeScheduleItem]:
+        """Return the Fee Schedule row (flat reimbursement) whose effective_date
+        is the most recent <= DOS, if any. Priority #1 in the pricing ladder —
+        when present, the APG formula is bypassed entirely."""
+        stmt = (
+            select(FeeScheduleItem)
+            .where(
+                FeeScheduleItem.hcpcs == hcpcs,
+                FeeScheduleItem.effective_date <= dos,
+            )
+            .order_by(FeeScheduleItem.effective_date.desc())
+            .limit(1)
+        )
+        res = await session.execute(stmt)
+        return res.scalar_one_or_none()
+
+    async def lookup_px_weight(
+        self, session: AsyncSession, hcpcs: str, dos: date
+    ) -> Optional[PxBasedWeight]:
+        """Return the Px-based weight row whose effective_date is the most
+        recent <= DOS, if any. Priority #2 in the pricing ladder — when
+        present (and fee schedule is not), this weight OVERRIDES the APG
+        weight but the rest of the APG formula (base rate, discounting,
+        packaging) still applies."""
+        stmt = (
+            select(PxBasedWeight)
+            .where(
+                PxBasedWeight.hcpcs == hcpcs,
+                PxBasedWeight.effective_date <= dos,
+            )
+            .order_by(PxBasedWeight.effective_date.desc())
+            .limit(1)
+        )
+        res = await session.execute(stmt)
+        return res.scalar_one_or_none()
+
     async def lookup_base_rate(
         self,
         session: AsyncSession,
@@ -287,14 +330,33 @@ class APGEngine:
         for sl in claim.service_lines:
             ctx = _LineContext(line_seq=sl.line_seq, svc=sl)
             code = sl.procedure_code or ""
+
+            # ---- Priority #1: Fee Schedule (flat reimbursement × units) ----
+            # If present, this bypasses the APG formula entirely for this line.
+            if code:
+                fs = await self.lookup_fee_schedule(session, code, dos)
+                if fs is not None and fs.reimbursement and fs.reimbursement > 0:
+                    units = Decimal(sl.units or 1)
+                    if fs.max_units is not None and fs.max_units > 0:
+                        units = min(units, Decimal(fs.max_units))
+                    ctx.raw_payment = Decimal(fs.reimbursement) * units
+                    ctx.fee_scheduled = True
+                    ctx.notes.append(
+                        f"Fee Schedule applied: ${fs.reimbursement} × {units} units "
+                        f"(eff {fs.effective_date.isoformat()}). APG formula bypassed."
+                    )
+                    # Still run EAPG lookup below for analytics / display,
+                    # but packaging/discounting will skip this line.
+
             if code:
                 hit = await self.lookup_hcpcs_eapg(session, code, dos)
                 if hit is not None:
                     ctx.eapg = hit.eapg
                     ctx.eapg_desc = hit.eapg_desc
+                    ctx.eapg_type_raw = hit.eapg_type
                     ctx.eapg_type = _coerce_eapg_type(hit.eapg_type)
                     ctx.eapg_category = hit.eapg_category
-                else:
+                elif not ctx.fee_scheduled:
                     ctx.notes.append(f"No EAPG mapping for HCPCS {code} on {dos.isoformat()}.")
 
             # Fall back to principal diagnosis if HCPCS didn't yield an EAPG
@@ -303,14 +365,33 @@ class APGEngine:
                 if hit is not None:
                     ctx.eapg = hit.eapg
                     ctx.eapg_desc = hit.eapg_desc
+                    ctx.eapg_type_raw = hit.eapg_type
                     ctx.eapg_type = _coerce_eapg_type(hit.eapg_type)
                     ctx.eapg_category = hit.eapg_category
                     ctx.notes.append(
                         f"Used ICD-10 {claim.principal_diagnosis} for EAPG assignment (no HCPCS hit)."
                     )
 
-            # Weight lookup
-            if ctx.eapg is not None:
+            # ---- Priority #2: Px-Based Weight override ----
+            # If fee schedule didn't fire and the HCPCS has a Px-specific weight,
+            # use that weight instead of the APG-level weight. The rest of the
+            # APG formula (base rate × weight, packaging, discounting) applies.
+            if not ctx.fee_scheduled and code:
+                pxw = await self.lookup_px_weight(session, code, dos)
+                if pxw is not None and pxw.weight and pxw.weight > 0:
+                    ctx.weight = Decimal(pxw.weight)
+                    ctx.px_weight_applied = True
+                    ctx.notes.append(
+                        f"Px-Based Weight applied: {pxw.weight} "
+                        f"(eff {pxw.effective_date.isoformat()}); overrides APG weight."
+                    )
+
+            # ---- Priority #3: APG weight (fallback, existing behavior) ----
+            if (
+                not ctx.fee_scheduled
+                and not ctx.px_weight_applied
+                and ctx.eapg is not None
+            ):
                 wrow = await self.lookup_apg_weight(session, ctx.eapg, dos)
                 if wrow is not None:
                     ctx.weight = wrow.weight
@@ -331,6 +412,9 @@ class APGEngine:
         for ctx in contexts:
             if ctx.packaged or ctx.denied:
                 ctx.raw_payment = Decimal("0")
+                continue
+            # Fee-scheduled lines already have raw_payment set from the flat rate.
+            if ctx.fee_scheduled:
                 continue
             if ctx.raw_payment == 0 and ctx.weight is not None and ctx.weight > 0:
                 ctx.raw_payment = base_rate * ctx.weight
@@ -411,11 +495,16 @@ class APGEngine:
         history means "not separately payable in this period."
         """
         has_significant = any(
-            c.eapg_type == EapgType.SIGNIFICANT_PROCEDURE and (c.weight or Decimal("0")) > 0
+            c.eapg_type == EapgType.SIGNIFICANT_PROCEDURE
+            and (c.weight or Decimal("0")) > 0
+            and not c.fee_scheduled
             for c in contexts
         )
 
         for c in contexts:
+            # Fee-scheduled lines bypass packaging — they pay at the flat rate.
+            if c.fee_scheduled:
+                continue
             if c.eapg_type == EapgType.INCIDENTAL:
                 c.packaged = True
                 c.notes.append("Packaged: Incidental EAPG type is not separately payable.")
@@ -437,6 +526,7 @@ class APGEngine:
             c for c in contexts
             if c.eapg_type == EapgType.SIGNIFICANT_PROCEDURE
             and not c.packaged
+            and not c.fee_scheduled
             and c.weight is not None
             and c.weight > 0
         ]
@@ -508,24 +598,61 @@ class APGEngine:
 # ---------------------------------------------------------------------------
 
 
-def _coerce_eapg_type(raw: Optional[str]) -> EapgType:
-    """Map a raw EAPG Type string (from HCPCS/ICD-10 crosswalk) to the enum.
+# v3.18 eMedNY EAPG Type names -> canonical engine EapgType.
+# The v3.18 crosswalk expanded the original 5-6 type names into 25+ more
+# granular categories. For the engine's pricing logic (packaging,
+# discounting) we collapse them back to the five categories the NYS DOH
+# APG methodology defines. The raw string is still preserved on the line
+# result (`eapg_type_raw`) for UI display.
+_V318_TYPE_TO_ENGINE: dict[str, EapgType] = {
+    # Legacy canonical five (still present in v3.18 output for many codes)
+    "significant procedure":           EapgType.SIGNIFICANT_PROCEDURE,
+    "medical visit":                   EapgType.MEDICAL_VISIT,
+    "ancillary":                       EapgType.ANCILLARY,
+    "incidental":                      EapgType.INCIDENTAL,
+    "add-on":                          EapgType.ADD_ON,
+    "add on":                          EapgType.ADD_ON,
+    # v3.18 expanded taxonomy
+    "per diem":                        EapgType.MEDICAL_VISIT,
+    "drug":                            EapgType.ANCILLARY,
+    "dme":                             EapgType.ANCILLARY,
+    "unassigned":                      EapgType.UNKNOWN,
+    "physical therapy & rehab":        EapgType.SIGNIFICANT_PROCEDURE,
+    "physical therapy and rehab":      EapgType.SIGNIFICANT_PROCEDURE,
+    "behavioral health & counseling":  EapgType.SIGNIFICANT_PROCEDURE,
+    "behavioral health and counseling":EapgType.SIGNIFICANT_PROCEDURE,
+    "dental or oral surgery procs":    EapgType.SIGNIFICANT_PROCEDURE,
+    "dental or oral surgery":          EapgType.SIGNIFICANT_PROCEDURE,
+    "radiologic procedure":            EapgType.SIGNIFICANT_PROCEDURE,
+    "diagnostic or therapeutic proc":  EapgType.SIGNIFICANT_PROCEDURE,
+    "diagnostic or therapeutic procedure": EapgType.SIGNIFICANT_PROCEDURE,
+}
 
-    The source data uses titles like "Significant Procedure", "Medical Visit",
-    "Ancillary", "Incidental", "Add-On". Anything else → UNKNOWN.
+
+def _coerce_eapg_type(raw: Optional[str]) -> EapgType:
+    """Map a raw EAPG Type string (v3.18 eMedNY crosswalk) to the canonical
+    engine enum. Handles the legacy five categories AND the richer v3.18
+    taxonomy (25+ subtypes). Unknown strings -> EapgType.UNKNOWN.
     """
     if not raw:
         return EapgType.UNKNOWN
     key = raw.strip()
+    # Fast path — exact match against the enum
     try:
         return EapgType(key)
     except ValueError:
-        # Tolerate variations like "Add On" vs "Add-On"
-        normalized = key.replace(" ", "-")
-        try:
-            return EapgType(normalized)
-        except ValueError:
-            pass
+        pass
+    # Normalized lookup against the v3.18 mapping
+    norm = key.lower().strip()
+    mapped = _V318_TYPE_TO_ENGINE.get(norm)
+    if mapped is not None:
+        return mapped
+    # Tolerate minor punctuation variation, e.g. "Add On" vs "Add-On"
+    try:
+        return EapgType(key.replace(" ", "-"))
+    except ValueError:
+        pass
+    log.warning("Unrecognized EAPG type %r; falling back to UNKNOWN", raw)
     return EapgType.UNKNOWN
 
 

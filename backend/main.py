@@ -710,6 +710,84 @@ async def reload_dtc_base_rates(
     }
 
 
+@app.post("/api/admin/reload-crosswalk")
+async def reload_crosswalk(
+    current: RequireAdmin,
+    request: Request,
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Upload eMedNY's APG Crosswalk workbook and replace the HCPCS→EAPG
+    and ICD-10→EAPG tables.
+
+    Admin only. Accepts .xlsx (the format eMedNY publishes). Preserves
+    weights, base rates, users, claims, and the audit log.
+    """
+    from backend.db.init_crosswalk import load_crosswalk_from_bytes
+
+    if not (file.filename or "").lower().endswith((".xlsx", ".xlsm")):
+        raise HTTPException(400, "File must be an Excel workbook (.xlsx or .xlsm)")
+
+    file_bytes = await file.read()
+    try:
+        result = await load_crosswalk_from_bytes(
+            session, file_bytes, filename=file.filename,
+        )
+    except ValueError as e:
+        raise HTTPException(400, f"Unable to parse crosswalk: {e}")
+    except Exception as e:
+        raise HTTPException(500, f"Loader failed: {e}")
+
+    await audit(
+        session, user=current, request=request,
+        action="crosswalk.reload",
+        resource=file.filename,
+        details={"file_size": len(file_bytes), **result},
+    )
+    await session.commit()
+    return {"ok": True, "filename": file.filename, **result}
+
+
+@app.post("/api/admin/reload-weights-history")
+async def reload_weights_history(
+    current: RequireAdmin,
+    request: Request,
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Upload NYS DOH's `history_and_fee_schedule.xls` and replace the APG
+    weight history, Px-based weight overrides, and flat-fee schedule.
+
+    Admin only. Accepts .xls (the legacy BIFF format NYS DOH publishes).
+    Preserves crosswalks, base rates, users, claims, and the audit log.
+    """
+    from backend.db.init_weights_history import load_weights_history_from_bytes
+
+    if not (file.filename or "").lower().endswith((".xls", ".xlsx", ".xlsm")):
+        raise HTTPException(
+            400, "File must be an Excel workbook (.xls, .xlsx, or .xlsm)"
+        )
+
+    file_bytes = await file.read()
+    try:
+        result = await load_weights_history_from_bytes(
+            session, file_bytes, filename=file.filename,
+        )
+    except ValueError as e:
+        raise HTTPException(400, f"Unable to parse workbook: {e}")
+    except Exception as e:
+        raise HTTPException(500, f"Loader failed: {e}")
+
+    await audit(
+        session, user=current, request=request,
+        action="weights_history.reload",
+        resource=file.filename,
+        details={"file_size": len(file_bytes), **result},
+    )
+    await session.commit()
+    return {"ok": True, "filename": file.filename, **result}
+
+
 @app.post("/api/admin/reload-reference-data")
 async def reload_reference_data(
     current: RequireAdmin,

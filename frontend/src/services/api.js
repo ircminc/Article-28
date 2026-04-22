@@ -126,6 +126,30 @@ export async function reloadDtcBaseRates(file) {
   return data;
 }
 
+// Admin: upload eMedNY's APG Crosswalk .xlsx. Replaces HCPCS->EAPG and
+// ICD-10->EAPG tables. Leaves weights, base rates, claims, users untouched.
+export async function reloadCrosswalk(file) {
+  const form = new FormData();
+  form.append('file', file);
+  const { data } = await apiClient.post('/api/admin/reload-crosswalk', form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 300_000,
+  });
+  return data;
+}
+
+// Admin: upload NYS DOH's history_and_fee_schedule.xls. Replaces APG
+// weight history, Px-based weight overrides, and the flat-fee schedule.
+export async function reloadWeightsHistory(file) {
+  const form = new FormData();
+  form.append('file', file);
+  const { data } = await apiClient.post('/api/admin/reload-weights-history', form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 300_000,
+  });
+  return data;
+}
+
 // ---------------------------------------------------------------------------
 // Uploads
 // ---------------------------------------------------------------------------

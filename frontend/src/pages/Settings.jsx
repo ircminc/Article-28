@@ -6,8 +6,10 @@ import {
   clearCmsCache,
   extractErrorMessage,
   getProvider,
+  reloadCrosswalk,
   reloadDtcBaseRates,
   reloadReferenceData,
+  reloadWeightsHistory,
   upsertProvider,
 } from '../services/api.js';
 import { useAuth } from '../auth/AuthContext.jsx';
@@ -373,19 +375,23 @@ function ReferenceDataTools({ queryClient, isAdmin }) {
         </div>
       </div>
 
-      {/* DTC base rates (partial update) */}
+      {/* Native NYS DOH / eMedNY files — preferred ingestion path */}
+      {isAdmin && <CrosswalkUpload queryClient={queryClient} />}
+      {isAdmin && <WeightsHistoryUpload queryClient={queryClient} />}
       {isAdmin && <DtcBaseRatesUpload queryClient={queryClient} />}
 
-      {/* APG workbook upload (admin only) */}
+      {/* Legacy combined-workbook upload (kept for back-compat) */}
       {isAdmin && (
         <div className="border-t border-slate-200 dark:border-slate-700 pt-4">
           <h3 className="text-sm font-medium text-slate-700 dark:text-slate-300">
-            APG reference data (NYS DOH workbook)
+            Legacy combined APG workbook
           </h3>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-            When NYS DOH publishes updated APG weights, base rates, or
-            HCPCS/ICD-10 crosswalks, download their updated Excel workbook and
-            upload it here. This replaces the 5 reference tables (HCPCS→EAPG,
+            Kept for back-compatibility with the pre-2026 compiled workbook.
+            Prefer the three native NYS DOH / eMedNY files above (Crosswalk,
+            History + Fee Schedule, DTC Base Rates) — they are published
+            directly by the state and stay in sync with each quarterly update.
+            This legacy uploader replaces the 5 reference tables (HCPCS→EAPG,
             ICD-10→EAPG, APG weights, base rates, provider county) while
             preserving all users, claims, and settings.
           </p>
@@ -434,6 +440,148 @@ function ReferenceDataTools({ queryClient, isAdmin }) {
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// eMedNY APG Crosswalk upload (HCPCS + ICD-10 → EAPG)
+// ---------------------------------------------------------------------------
+
+function CrosswalkUpload({ queryClient }) {
+  const [file, setFile] = useState(null);
+  const mut = useMutation({
+    mutationFn: (f) => reloadCrosswalk(f),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['analytics'] });
+      queryClient.invalidateQueries({ queryKey: ['claims'] });
+      queryClient.invalidateQueries({ queryKey: ['health'] });
+      setFile(null);
+    },
+  });
+
+  return (
+    <div className="border-t border-slate-200 dark:border-slate-700 pt-4">
+      <h3 className="text-sm font-medium text-slate-700 dark:text-slate-300">
+        APG Crosswalk (eMedNY / Solventum v3.18)
+      </h3>
+      <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+        eMedNY publishes the current APG Crosswalk at
+        {' '}<code>APGcrosswalk&lt;MMDDYYYY&gt;.xlsx</code>. Upload it here to
+        refresh both HCPCS→EAPG (~20k rows) and ICD-10→EAPG (~75k rows).
+        Weights, base rates, claims, users, and settings are left untouched.
+      </p>
+      <div className="mt-3 flex flex-wrap items-center gap-3">
+        <label className="btn-secondary cursor-pointer">
+          <UploadIcon className="w-4 h-4" aria-hidden />
+          {file ? file.name : 'Choose crosswalk file (.xlsx)'}
+          <input
+            type="file"
+            accept=".xlsx,.xlsm"
+            className="hidden"
+            onChange={(e) => setFile(e.target.files[0] || null)}
+          />
+        </label>
+        {file && (
+          <button
+            type="button"
+            className="btn-primary"
+            onClick={() => mut.mutate(file)}
+            disabled={mut.isPending}
+          >
+            {mut.isPending ? 'Loading crosswalk…' : 'Upload & replace crosswalk'}
+          </button>
+        )}
+        {mut.isSuccess && (
+          <span className="pill-success">
+            <CheckCircle2 className="w-3 h-3" aria-hidden />
+            Loaded {mut.data?.hcpcs_rows ?? 0} HCPCS +
+            {' '}{mut.data?.icd10_rows ?? 0} ICD-10 rows.
+          </span>
+        )}
+        {mut.isError && (
+          <span className="pill-danger">
+            <AlertCircle className="w-3 h-3" aria-hidden />
+            {extractErrorMessage(mut.error)}
+          </span>
+        )}
+      </div>
+      {mut.isPending && (
+        <p className="text-xs text-slate-500 mt-2">
+          This takes 1–2 minutes for ~95,000 rows. Please don't close the page.
+        </p>
+      )}
+    </div>
+  );
+}
+
+
+// ---------------------------------------------------------------------------
+// NYS DOH Weights + Px + Fee Schedule upload (history_and_fee_schedule.xls)
+// ---------------------------------------------------------------------------
+
+function WeightsHistoryUpload({ queryClient }) {
+  const [file, setFile] = useState(null);
+  const mut = useMutation({
+    mutationFn: (f) => reloadWeightsHistory(f),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['analytics'] });
+      queryClient.invalidateQueries({ queryKey: ['claims'] });
+      queryClient.invalidateQueries({ queryKey: ['health'] });
+      setFile(null);
+    },
+  });
+
+  return (
+    <div className="border-t border-slate-200 dark:border-slate-700 pt-4">
+      <h3 className="text-sm font-medium text-slate-700 dark:text-slate-300">
+        APG weights + Px-based weights + Fee Schedule
+      </h3>
+      <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+        NYS DOH publishes <code>history_and_fee_schedule.xls</code> with three
+        sheets: historical APG weights, procedure-specific weight overrides
+        (Px-based), and flat-rate fee schedule amounts. Uploading here
+        refreshes the full pricing ladder — Fee Schedule (priority 1) &gt; Px
+        Weight (priority 2) &gt; APG Weight (priority 3). Crosswalks and base
+        rates are left untouched.
+      </p>
+      <div className="mt-3 flex flex-wrap items-center gap-3">
+        <label className="btn-secondary cursor-pointer">
+          <UploadIcon className="w-4 h-4" aria-hidden />
+          {file ? file.name : 'Choose weights + fee schedule file (.xls)'}
+          <input
+            type="file"
+            accept=".xls,.xlsx,.xlsm"
+            className="hidden"
+            onChange={(e) => setFile(e.target.files[0] || null)}
+          />
+        </label>
+        {file && (
+          <button
+            type="button"
+            className="btn-primary"
+            onClick={() => mut.mutate(file)}
+            disabled={mut.isPending}
+          >
+            {mut.isPending ? 'Loading…' : 'Upload & replace weights + fees'}
+          </button>
+        )}
+        {mut.isSuccess && (
+          <span className="pill-success">
+            <CheckCircle2 className="w-3 h-3" aria-hidden />
+            Loaded {mut.data?.apg_weights ?? 0} APG weights,
+            {' '}{mut.data?.px_weights ?? 0} Px weights,
+            {' '}{mut.data?.fee_schedule ?? 0} fee schedule rows.
+          </span>
+        )}
+        {mut.isError && (
+          <span className="pill-danger">
+            <AlertCircle className="w-3 h-3" aria-hidden />
+            {extractErrorMessage(mut.error)}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 
 // ---------------------------------------------------------------------------
 // DTC base-rates upload (partial update — only source='dtc' rows touched)

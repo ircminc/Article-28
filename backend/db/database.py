@@ -184,6 +184,57 @@ class ProviderCounty(Base):
     region: Mapped[str] = mapped_column(String(16))
 
 
+class PxBasedWeight(Base):
+    """Procedure-based weight OVERRIDE for specific HCPCS codes.
+
+    From NYS DOH's `history_and_fee_schedule.xls` → "Final Px Based Weights"
+    sheet. When a procedure has a non-zero Px weight for a given DOS, that
+    weight is used INSTEAD of the APG-level weight from `apg_weights`.
+    (Priority #2 in the APG engine's pricing ladder, below Fee Schedule.)
+
+    Long form: one row per (hcpcs, effective_date). units_limit caps how
+    many units can be billed per visit for that procedure.
+    """
+    __tablename__ = "px_based_weights"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    hcpcs: Mapped[str] = mapped_column(String(12), index=True)
+    description: Mapped[Optional[str]] = mapped_column(String(256))
+    effective_date: Mapped[date] = mapped_column(Date, index=True)
+    weight: Mapped[Decimal] = mapped_column(Numeric(12, 6))
+    units_limit: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))
+
+    __table_args__ = (
+        Index("ix_px_weight_lookup", "hcpcs", "effective_date"),
+    )
+
+
+class FeeScheduleItem(Base):
+    """Flat fee-schedule reimbursement for specific HCPCS codes.
+
+    From NYS DOH's `history_and_fee_schedule.xls` → "Fee Schedule" sheet.
+    When a procedure has a non-zero fee-schedule amount for a given DOS,
+    the payment for that line is `reimbursement × units` — the APG formula
+    is BYPASSED entirely. (Priority #1 in the APG engine's pricing ladder.)
+
+    Typical fee-schedule procedures: IUD insertion, abortion, certain
+    neurostimulator placements, etc. — where NYS DOH wants to pay a flat
+    rate regardless of the APG peer group.
+    """
+    __tablename__ = "fee_schedule"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    hcpcs: Mapped[str] = mapped_column(String(12), index=True)
+    description: Mapped[Optional[str]] = mapped_column(String(256))
+    effective_date: Mapped[date] = mapped_column(Date, index=True)
+    reimbursement: Mapped[Decimal] = mapped_column(Numeric(12, 2))
+    max_units: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))
+
+    __table_args__ = (
+        Index("ix_fee_schedule_lookup", "hcpcs", "effective_date"),
+    )
+
+
 class ZipLocality(Base):
     """CMS ZIP code → Medicare locality mapping. Source: annual CMS ZIP5 file at
     https://www.cms.gov/medicare/medicare-fee-service-payments/physicianfeesched/
