@@ -287,7 +287,7 @@ export default function Calculator() {
 // Results
 // ---------------------------------------------------------------------------
 function ResultsPanel({ data, useFacilityRate }) {
-  const { apg, cms_lines, cms_locality_used, warnings } = data;
+  const { apg, icd_based_eapg, cms_lines, cms_locality_used, warnings } = data;
 
   return (
     <div className="space-y-4">
@@ -302,7 +302,7 @@ function ResultsPanel({ data, useFacilityRate }) {
         </div>
       )}
 
-      {apg && <APGResultCard apg={apg} />}
+      {apg && <APGResultCard apg={apg} icdBased={icd_based_eapg} />}
       {cms_lines && (
         <CMSResultCard
           cms_lines={cms_lines}
@@ -318,7 +318,7 @@ function ResultsPanel({ data, useFacilityRate }) {
 // ---------------------------------------------------------------------------
 // APG result — provider context + per-line math chain
 // ---------------------------------------------------------------------------
-function APGResultCard({ apg }) {
+function APGResultCard({ apg, icdBased }) {
   const sign = varianceSign(apg.variance);
   const varClass =
     sign === 'under' ? 'text-danger-700'
@@ -386,10 +386,13 @@ function APGResultCard({ apg }) {
         </div>
       </div>
 
+      {/* Primary ICD-derived EAPG (informational — not in the payment total) */}
+      {icdBased && <ICDBasedSection icd={icdBased} />}
+
       {/* Per-line math chain */}
       <div>
         <h3 className="text-xs uppercase tracking-wide text-slate-500 mb-2">
-          Per-line math
+          Per-line math (HCPCS-driven — official APG payment)
         </h3>
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
@@ -437,6 +440,76 @@ function APGResultCard({ apg }) {
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// ICD-derived EAPG — informational block shown above the HCPCS-driven math.
+// The payment is never sourced from this block; per NYS DOH methodology the
+// per-line HCPCS assignments drive payment. This section exists to let users
+// verify the system recognizes the principal diagnosis and to see what that
+// diagnosis would pay if the claim were priced purely on a medical-visit
+// basis.
+// ---------------------------------------------------------------------------
+function ICDBasedSection({ icd }) {
+  const resolved = icd.eapg !== null && icd.eapg !== undefined;
+  const displayDx =
+    icd.input_dx_code && icd.input_dx_code !== icd.dx_code
+      ? `${icd.input_dx_code} → ${icd.dx_code}`
+      : (icd.input_dx_code || icd.dx_code);
+
+  return (
+    <section className="bg-brand-50/40 border border-brand-100 rounded-md p-4 text-sm">
+      <div className="flex items-baseline justify-between flex-wrap gap-2 mb-3">
+        <h3 className="text-xs uppercase tracking-wide text-brand-900 font-semibold">
+          Primary ICD-derived EAPG (informational)
+        </h3>
+        <span className="text-[11px] text-slate-500 italic">
+          Not included in the payment total — shown for transparency
+        </span>
+      </div>
+
+      {!resolved ? (
+        <div className="text-slate-600">
+          <div className="font-medium">Principal ICD-10: <code>{displayDx}</code></div>
+          <div className="text-xs text-slate-500 mt-1">
+            {icd.note || 'No EAPG mapping found for this diagnosis on the given date of service.'}
+          </div>
+        </div>
+      ) : (
+        <>
+          <dl className="grid grid-cols-2 md:grid-cols-5 gap-3">
+            <Factor label="Principal ICD-10" value={<code className="text-[13px]">{displayDx}</code>} strong />
+            <Factor label="Resolved EAPG" value={`${icd.eapg}${icd.eapg_desc ? ` · ${icd.eapg_desc}` : ''}`} />
+            <Factor label="EAPG type" value={icd.eapg_type_raw || icd.eapg_type || '—'} />
+            <Factor
+              label="Weight"
+              value={icd.weight !== null && icd.weight !== undefined
+                ? parseFloat(icd.weight).toFixed(4)
+                : '—'}
+            />
+            <Factor
+              label="Indicative payment"
+              value={icd.indicative_payment !== null && icd.indicative_payment !== undefined
+                ? fmtCurrency(icd.indicative_payment)
+                : '—'}
+              strong
+            />
+          </dl>
+          {icd.weight !== null && icd.weight !== undefined ? (
+            <p className="text-xs text-slate-500 mt-3">
+              Indicative payment = <code>{parseFloat(icd.weight).toFixed(4)} × {fmtCurrency(icd.base_rate)} = {fmtCurrency(icd.indicative_payment)}</code>.
+              What the claim would pay if billed as a single medical-visit line under this EAPG. Actual payment is driven by the per-line HCPCS math below.
+            </p>
+          ) : (
+            <p className="text-xs text-slate-500 mt-3">
+              {icd.note || 'Weight lookup returned no row for this EAPG — indicative rate unavailable.'}
+            </p>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
 
 function APGLineRow({ ld, baseRate }) {
   // Build the human-readable calculation string, e.g.:

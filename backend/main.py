@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Optional
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
@@ -1281,10 +1281,71 @@ async def calculator_calculate(
                     "updated against the new pfs.data.cms.gov API."
                 )
 
+    # ------------------------ ICD-based EAPG (informational) --------------
+    # Resolve the principal diagnosis to its EAPG and show it alongside the
+    # per-HCPCS-line math so users can sanity-check the dx mapping. This is
+    # PURELY informational — the APG payment total above is already correct
+    # per NYS DOH methodology (HCPCS drives each line's EAPG).
+    icd_based = None
+    if (
+        payload.target in (CalculationTarget.APG, CalculationTarget.BOTH)
+        and payload.principal_diagnosis
+        and apg_result is not None
+    ):
+        from backend.models.schemas import ICDBasedEAPG
+        from backend.engines.apg_engine import normalize_dx_code, _coerce_eapg_type
+
+        apg_engine = APGEngine()
+        normalized = normalize_dx_code(payload.principal_diagnosis) or ""
+        icd_row = None
+        if normalized:
+            icd_row = await apg_engine.lookup_icd10_eapg(
+                session, normalized, payload.date_of_service,
+            )
+
+        base_rate = apg_result.base_rate_applied
+        if icd_row is None:
+            icd_based = ICDBasedEAPG(
+                dx_code=normalized,
+                input_dx_code=payload.principal_diagnosis,
+                base_rate=base_rate,
+                note=(f"ICD-10 {payload.principal_diagnosis!r} did not resolve to an "
+                      f"EAPG on {payload.date_of_service.isoformat()}."),
+            )
+        else:
+            # Look up the APG-level weight for this EAPG on this DOS so we can
+            # show an indicative rate.
+            weight_row = await apg_engine.lookup_apg_weight(
+                session, icd_row.eapg, payload.date_of_service,
+            )
+            weight = weight_row.weight if weight_row is not None else None
+            indicative = None
+            if weight is not None and base_rate > 0:
+                indicative = (weight * base_rate).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP,
+                )
+            coerced_type = _coerce_eapg_type(icd_row.eapg_type)
+            icd_based = ICDBasedEAPG(
+                dx_code=normalized,
+                input_dx_code=payload.principal_diagnosis,
+                eapg=icd_row.eapg,
+                eapg_desc=icd_row.eapg_desc or icd_row.description,
+                eapg_type=coerced_type,
+                eapg_type_raw=icd_row.eapg_type,
+                eapg_category=icd_row.eapg_category,
+                weight=weight,
+                base_rate=base_rate,
+                indicative_payment=indicative,
+                note=(None if weight is not None
+                      else f"No weight row found for EAPG {icd_row.eapg} on "
+                           f"{payload.date_of_service.isoformat()}."),
+            )
+
     return CalculatorOut(
         date_of_service=payload.date_of_service,
         target=payload.target,
         apg=apg_result,
+        icd_based_eapg=icd_based,
         cms_locality_used=cms_locality_used,
         cms_lines=cms_lines,
         warnings=warnings,

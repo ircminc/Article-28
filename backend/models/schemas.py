@@ -399,6 +399,30 @@ class CalculatorLineCMS(BaseModel):
     error: Optional[str] = None                  # e.g. "no rate found" / "locality missing"
 
 
+class ICDBasedEAPG(BaseModel):
+    """Informational: what EAPG the principal ICD-10 maps to on this DOS.
+
+    Surfaced alongside (not instead of) the per-HCPCS-line APG math so users
+    can verify the system is recognizing their diagnosis mapping correctly.
+    The actual claim payment is still driven by the per-line HCPCS EAPG
+    assignments per NYS DOH methodology — this block is for transparency.
+    """
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    dx_code: str                              # normalized (uppercase, no dots)
+    input_dx_code: str                        # exactly what the user typed
+    eapg: Optional[int] = None
+    eapg_desc: Optional[str] = None
+    eapg_type: Optional[EapgType] = None
+    eapg_type_raw: Optional[str] = None       # v3.18 full name (e.g. "Radiologic Procedure")
+    eapg_category: Optional[str] = None
+    weight: Optional[Decimal] = None
+    base_rate: Decimal
+    # weight × base_rate for one unit, no packaging/discounting adjustments.
+    # None when the dx didn't resolve or no weight row was found.
+    indicative_payment: Optional[Decimal] = None
+    note: Optional[str] = None                # explanation when no match
+
+
 class CalculatorOut(BaseModel):
     """POST response: the full APG calculation (if requested) plus per-line CMS
     comparisons (if requested). Either or both may be null depending on target."""
@@ -406,6 +430,9 @@ class CalculatorOut(BaseModel):
     date_of_service: date
     target: CalculationTarget
     apg: Optional[APGResult] = None
+    # Informational: EAPG resolved from the principal ICD-10, shown above the
+    # per-HCPCS-line math. Not included in the payment total.
+    icd_based_eapg: Optional[ICDBasedEAPG] = None
     cms_locality_used: Optional[str] = None
     cms_lines: Optional[list[CalculatorLineCMS]] = None
     warnings: list[str] = Field(default_factory=list)
