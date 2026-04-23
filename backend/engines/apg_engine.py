@@ -79,6 +79,27 @@ def _round_money(v: Decimal) -> Decimal:
     return v.quantize(CENT, rounding=ROUND_HALF_UP)
 
 
+def normalize_dx_code(raw: Optional[str]) -> Optional[str]:
+    """Canonicalize an ICD-10-CM diagnosis code for storage + lookup.
+
+    NYS DOH / eMedNY / Solventum publish codes in the dot-free canonical
+    form (`I10`, `A000`, `I4891`). Real-world inputs — whether typed into
+    the Rate Calculator (`I10.0`, `i48.91`) or extracted from EDI 837
+    HI segments (`I10.0`, ` I10 `) — show up in every imaginable format.
+
+    Applying this single normalizer consistently at ingestion and at
+    lookup time makes those formatting differences irrelevant and keeps
+    the ICD-10 → EAPG fallback from silently missing because of a stray
+    dot or lowercase letter.
+
+    Returns None for empty input.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip().upper().replace(".", "")
+    return s or None
+
+
 # ---------------------------------------------------------------------------
 # Internal dataclasses (engine-local)
 # ---------------------------------------------------------------------------
@@ -161,11 +182,19 @@ class APGEngine:
     async def lookup_icd10_eapg(
         self, session: AsyncSession, dx: str, dos: date
     ) -> Optional[Icd10ToEapg]:
-        """Fallback diagnosis-based EAPG lookup. Same date rules as HCPCS."""
+        """Fallback diagnosis-based EAPG lookup. Same date rules as HCPCS.
+
+        Incoming `dx` is normalized (uppercase, dots stripped, whitespace
+        trimmed) so callers don't have to worry about format — `I10.0`,
+        `i10.0`, `  I10  `, and `I100` all resolve to the same row.
+        """
+        key = normalize_dx_code(dx)
+        if not key:
+            return None
         stmt = (
             select(Icd10ToEapg)
             .where(
-                Icd10ToEapg.dx_code == dx,
+                Icd10ToEapg.dx_code == key,
                 or_(Icd10ToEapg.effective_date.is_(None), Icd10ToEapg.effective_date <= dos),
                 or_(Icd10ToEapg.end_date.is_(None), Icd10ToEapg.end_date >= dos),
             )

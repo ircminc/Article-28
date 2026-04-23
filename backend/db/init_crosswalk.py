@@ -293,8 +293,17 @@ async def _load_icd10_sheet(
             code_s = str(type_code).strip()
             type_str = eapg_type_map.get(code_s, code_s)
 
+        # Canonicalize the dx code so any stored row matches what the
+        # engine / Rate Calculator / reference endpoints look up.
+        # The Solventum source already publishes in dot-free canonical
+        # form, but running through normalize_dx_code is cheap insurance
+        # in case the sheet format ever changes.
+        from backend.engines.apg_engine import normalize_dx_code
+        canonical_dx = normalize_dx_code(dx)
+        if not canonical_dx:
+            continue
         batch.append(Icd10ToEapg(
-            dx_code=str(dx).upper(),
+            dx_code=canonical_dx,
             description=_clean(row[ci_desc]) if ci_desc is not None else None,
             gender=str(_clean(row[ci_gender])) if ci_gender is not None and _clean(row[ci_gender]) is not None else None,
             eapg=eapg,

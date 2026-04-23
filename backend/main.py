@@ -942,7 +942,9 @@ async def lookup_icd10(
     session: AsyncSession = Depends(get_session),
 ) -> Icd10LookupOut:
     apg = APGEngine()
-    row = await apg.lookup_icd10_eapg(session, code.upper().strip(), dos)
+    # lookup_icd10_eapg normalizes internally (uppercase + dot-strip),
+    # so 'I10.0', 'i10.0', 'I100' all resolve to the same row.
+    row = await apg.lookup_icd10_eapg(session, code, dos)
     if row is None:
         raise HTTPException(404, f"No EAPG mapping for DX {code} on {dos.isoformat()}")
     return Icd10LookupOut(
@@ -1136,6 +1138,10 @@ async def calculator_calculate(
                 (Decimal(str(sl.billed_amount or 0)) for sl in payload.service_lines),
                 Decimal("0"),
             )
+            # Normalize dx codes here too (engine does it on lookup, but
+            # storing the canonical form keeps downstream queries / exports
+            # consistent across the Calculator and EDI-upload paths).
+            from backend.engines.apg_engine import normalize_dx_code
             synthetic = ParsedClaimDTO(
                 file_type=FileType.ERA_835I,
                 claim_id=f"CALC-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}",
@@ -1143,8 +1149,11 @@ async def calculator_calculate(
                 billed_amount=paid_total,   # shown as "Billed total" in UI
                 paid_amount=paid_total,     # drives variance
                 allowed_amount=paid_total,
-                principal_diagnosis=payload.principal_diagnosis,
-                other_diagnoses=list(payload.other_diagnoses),
+                principal_diagnosis=normalize_dx_code(payload.principal_diagnosis),
+                other_diagnoses=[
+                    d for d in (normalize_dx_code(x) for x in payload.other_diagnoses)
+                    if d
+                ],
                 service_lines=[
                     ServiceLineDTO(
                         line_seq=i,

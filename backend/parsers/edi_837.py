@@ -101,7 +101,11 @@ def _extract_hi_diagnoses(seg: Segment) -> list[tuple[str, str]]:
         if len(parts) < 2:
             continue
         qualifier = parts[0].strip().upper()
-        code = parts[1].strip()
+        # Canonicalize ICD codes to the dot-free uppercase form the crosswalk
+        # stores them in (NYS DOH / eMedNY publish without dots). EDI 5010
+        # submitters are supposed to omit dots too, but in practice many
+        # don't — stripping here keeps the engine's lookup from missing.
+        code = parts[1].strip().upper().replace(".", "")
         if code:
             out.append((qualifier, code))
     return out
