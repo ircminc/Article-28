@@ -710,6 +710,46 @@ async def reload_dtc_base_rates(
     }
 
 
+@app.post("/api/admin/reload-apg-base-rates-v2")
+async def reload_apg_base_rates_v2(
+    current: RequireAdmin,
+    request: Request,
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Upload PMTAC's 'Updated APG Fee Calculator' workbook and replace every
+    `source='dtc'` row in `apg_base_rates`. Only the 'Updated APG Base Rate'
+    sheet is read — other sheets (crosswalks, weights) are ignored since
+    those are sourced from the native NYS DOH / eMedNY files.
+
+    Admin only. Accepts .xlsx. Hospital base rates, crosswalks, weights,
+    claims, users, and the audit log are all preserved.
+    """
+    from backend.db.init_apg_base_rates_v2 import load_apg_base_rates_v2_from_bytes
+
+    if not (file.filename or "").lower().endswith((".xlsx", ".xlsm")):
+        raise HTTPException(400, "File must be an Excel workbook (.xlsx or .xlsm)")
+
+    file_bytes = await file.read()
+    try:
+        result = await load_apg_base_rates_v2_from_bytes(
+            session, file_bytes, filename=file.filename,
+        )
+    except ValueError as e:
+        raise HTTPException(400, f"Unable to parse workbook: {e}")
+    except Exception as e:
+        raise HTTPException(500, f"Loader failed: {e}")
+
+    await audit(
+        session, user=current, request=request,
+        action="apg_base_rates_v2.reload",
+        resource=file.filename,
+        details={"file_size": len(file_bytes), **result},
+    )
+    await session.commit()
+    return {"ok": True, "filename": file.filename, **result}
+
+
 @app.post("/api/admin/reload-crosswalk")
 async def reload_crosswalk(
     current: RequireAdmin,

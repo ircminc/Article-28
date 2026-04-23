@@ -126,6 +126,21 @@ export async function reloadDtcBaseRates(file) {
   return data;
 }
 
+// Admin: upload PMTAC's "Updated APG Fee Calculator" workbook. Replaces
+// every source='dtc' row in apg_base_rates from the 'Updated APG Base Rate'
+// sheet (all freestanding peer groups × Upstate/Downstate × historical
+// effective dates through 2022-04-01). Leaves hospital rates, crosswalks,
+// weights, claims, and users untouched.
+export async function reloadApgBaseRatesV2(file) {
+  const form = new FormData();
+  form.append('file', file);
+  const { data } = await apiClient.post('/api/admin/reload-apg-base-rates-v2', form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 120_000,
+  });
+  return data;
+}
+
 // Admin: upload eMedNY's APG Crosswalk .xlsx. Replaces HCPCS->EAPG and
 // ICD-10->EAPG tables. Leaves weights, base rates, claims, users untouched.
 export async function reloadCrosswalk(file) {

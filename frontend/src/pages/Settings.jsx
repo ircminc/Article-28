@@ -6,6 +6,7 @@ import {
   clearCmsCache,
   extractErrorMessage,
   getProvider,
+  reloadApgBaseRatesV2,
   reloadCrosswalk,
   reloadDtcBaseRates,
   reloadReferenceData,
@@ -375,6 +376,9 @@ function ReferenceDataTools({ queryClient, isAdmin }) {
         </div>
       </div>
 
+      {/* PMTAC compiled APG Fee Calculator — authoritative base rates */}
+      {isAdmin && <ApgBaseRatesV2Upload queryClient={queryClient} />}
+
       {/* Native NYS DOH / eMedNY files — preferred ingestion path */}
       {isAdmin && <CrosswalkUpload queryClient={queryClient} />}
       {isAdmin && <WeightsHistoryUpload queryClient={queryClient} />}
@@ -440,6 +444,81 @@ function ReferenceDataTools({ queryClient, isAdmin }) {
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// PMTAC "Updated APG Fee Calculator" — authoritative DTC base rates
+// (reads the 'Updated APG Base Rate' sheet only; ignores other sheets)
+// ---------------------------------------------------------------------------
+
+function ApgBaseRatesV2Upload({ queryClient }) {
+  const [file, setFile] = useState(null);
+  const mut = useMutation({
+    mutationFn: (f) => reloadApgBaseRatesV2(f),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['analytics'] });
+      queryClient.invalidateQueries({ queryKey: ['claims'] });
+      queryClient.invalidateQueries({ queryKey: ['health'] });
+      setFile(null);
+    },
+  });
+
+  return (
+    <div className="border-t border-slate-200 dark:border-slate-700 pt-4">
+      <h3 className="text-sm font-medium text-slate-700 dark:text-slate-300">
+        APG base rates (PMTAC Updated APG Fee Calculator)
+      </h3>
+      <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+        Upload the <code>Updated APG Fee Calculator - MMDDYYYY.xlsx</code>
+        workbook. Reads only the <code>Updated APG Base Rate</code> sheet and
+        replaces every DTC base-rate row (all freestanding peer groups ×
+        Upstate/Downstate, across every published effective date through
+        4/1/2022). The engine picks the most-recent rate ≤ date-of-service
+        by exact peer-group match, so for any 2022-04-01-or-later claim the
+        newest rates apply automatically. Hospital rates, crosswalks,
+        weights, users, and claims are left untouched.
+      </p>
+      <div className="mt-3 flex flex-wrap items-center gap-3">
+        <label className="btn-secondary cursor-pointer">
+          <UploadIcon className="w-4 h-4" aria-hidden />
+          {file ? file.name : 'Choose APG Fee Calculator (.xlsx)'}
+          <input
+            type="file"
+            accept=".xlsx,.xlsm"
+            className="hidden"
+            onChange={(e) => setFile(e.target.files[0] || null)}
+          />
+        </label>
+        {file && (
+          <button
+            type="button"
+            className="btn-primary"
+            onClick={() => mut.mutate(file)}
+            disabled={mut.isPending}
+          >
+            {mut.isPending ? 'Loading…' : 'Upload & replace APG base rates'}
+          </button>
+        )}
+        {mut.isSuccess && (
+          <span className="pill-success">
+            <CheckCircle2 className="w-3 h-3" aria-hidden />
+            Replaced {mut.data?.rows_deleted ?? 0} old row(s) with
+            {' '}{mut.data?.rows_inserted ?? 0} new row(s)
+            {mut.data?.most_recent_effective_date && (
+              <> (newest eff {mut.data.most_recent_effective_date}).</>
+            )}
+          </span>
+        )}
+        {mut.isError && (
+          <span className="pill-danger">
+            <AlertCircle className="w-3 h-3" aria-hidden />
+            {extractErrorMessage(mut.error)}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 
 // ---------------------------------------------------------------------------
 // eMedNY APG Crosswalk upload (HCPCS + ICD-10 → EAPG)
