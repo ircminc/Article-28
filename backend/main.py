@@ -660,6 +660,76 @@ async def clear_cms_cache(
     return {"cached_rates_cleared": n}
 
 
+@app.delete("/api/admin/master-reset-reference-data", status_code=200)
+async def master_reset_reference_data(
+    current: RequireAdmin,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Wipe every reference / rate table so a fresh upload can start clean.
+
+    Admin only. The intent is "I'm about to re-load all reference data from
+    new files; remove everything that was loaded before so nothing stale
+    sticks around." Returns per-table row counts that were removed so the
+    UI can show a confirmation summary.
+
+    Tables wiped:
+      * apg_base_rates       (DTC + hospital base rates)
+      * hcpcs_to_eapg        (HCPCS → EAPG crosswalk)
+      * icd10_to_eapg        (ICD-10 → EAPG crosswalk)
+      * apg_weights          (APG-level relative weights)
+      * px_based_weights     (Procedure-specific weight overrides)
+      * fee_schedule         (Flat-rate fee schedule)
+      * cms_rate_cache       (CMS MPFS cache — re-fetched on next lookup)
+
+    Tables PRESERVED:
+      * users, user_session, audit_log    (auth + governance)
+      * provider_config                   (active + history)
+      * provider_county                   (NY county → region; rarely changes)
+      * zip_locality                      (CMS locality cache)
+      * parsed_claims, service_lines,
+        adjustments, apg_results          (claim history is preserved;
+                                           use /api/claims to clear it)
+    """
+    from backend.db.database import (
+        ApgBaseRate, ApgWeight, CmsRateCache, FeeScheduleItem,
+        HcpcsToEapg, Icd10ToEapg, PxBasedWeight,
+    )
+
+    counts: dict[str, int] = {}
+    # Order matters only if FKs are involved; these tables are independent.
+    for label, cls in [
+        ("apg_base_rates", ApgBaseRate),
+        ("hcpcs_to_eapg", HcpcsToEapg),
+        ("icd10_to_eapg", Icd10ToEapg),
+        ("apg_weights", ApgWeight),
+        ("px_based_weights", PxBasedWeight),
+        ("fee_schedule", FeeScheduleItem),
+        ("cms_rate_cache", CmsRateCache),
+    ]:
+        n = (await session.execute(select(func.count()).select_from(cls))).scalar_one()
+        await session.execute(delete(cls))
+        counts[label] = n
+
+    total = sum(counts.values())
+    await audit(
+        session, user=current, request=request,
+        action="reference_data.master_reset",
+        resource=f"{total} row(s) across {len(counts)} table(s)",
+        details=counts,
+    )
+    await session.commit()
+    return {
+        "ok": True,
+        "rows_deleted_total": total,
+        "by_table": counts,
+        "preserved": [
+            "users", "audit_log", "provider_config", "provider_county",
+            "zip_locality", "parsed_claims (use /api/claims to clear)",
+        ],
+    }
+
+
 @app.post("/api/admin/reload-dtc-rates")
 async def reload_dtc_base_rates(
     current: RequireAdmin,

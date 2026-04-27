@@ -6,6 +6,7 @@ import {
   clearCmsCache,
   extractErrorMessage,
   getProvider,
+  masterResetReferenceData,
   reloadApgBaseRatesV2,
   reloadCrosswalk,
   reloadDtcBaseRates,
@@ -439,6 +440,128 @@ function ReferenceDataTools({ queryClient, isAdmin }) {
               Please don't close the page.
             </p>
           )}
+        </div>
+      )}
+
+      {/* Master Reset — admin-only destructive action; placed last for safety */}
+      {isAdmin && <MasterResetButton queryClient={queryClient} />}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Master Reset — wipes every reference / rate table so fresh uploads can
+// start clean. Two-step confirmation; preserves auth, audit, claims, and
+// providers. Admin only.
+// ---------------------------------------------------------------------------
+function MasterResetButton({ queryClient }) {
+  const [confirming, setConfirming] = useState(false);
+  const [typedConfirm, setTypedConfirm] = useState('');
+
+  const mut = useMutation({
+    mutationFn: () => masterResetReferenceData(),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['health'] });
+      queryClient.invalidateQueries({ queryKey: ['analytics'] });
+      queryClient.invalidateQueries({ queryKey: ['claims'] });
+      setConfirming(false);
+      setTypedConfirm('');
+    },
+  });
+
+  const requireText = 'RESET';
+  const canConfirm = typedConfirm === requireText;
+
+  return (
+    <div className="border-t border-danger-200 dark:border-danger-800 pt-4">
+      <h3 className="text-sm font-medium text-danger-700 dark:text-danger-400 flex items-center gap-2">
+        <AlertCircle className="w-4 h-4" aria-hidden />
+        Master Reset — clear all APG &amp; CMS rate tables
+      </h3>
+      <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+        Deletes every row from <code>apg_base_rates</code>,{' '}
+        <code>hcpcs_to_eapg</code>, <code>icd10_to_eapg</code>,{' '}
+        <code>apg_weights</code>, <code>px_based_weights</code>,{' '}
+        <code>fee_schedule</code>, and <code>cms_rate_cache</code>. Use this
+        before re-uploading a fresh set of reference files when you want
+        zero leftover data. Users, audit log, providers, claims, and the
+        county/locality mapping tables are <strong>preserved</strong>.
+      </p>
+
+      {!confirming ? (
+        <div className="mt-3">
+          <button
+            type="button"
+            className="btn-danger"
+            onClick={() => setConfirming(true)}
+          >
+            <AlertCircle className="w-4 h-4" aria-hidden />
+            Master Reset…
+          </button>
+        </div>
+      ) : (
+        <div className="mt-3 rounded-md border border-danger-200 bg-danger-50 dark:bg-danger-900/20 p-3 space-y-3">
+          <p className="text-sm text-danger-800 dark:text-danger-300 font-medium">
+            This will permanently delete every reference rate row in the
+            database. To proceed, type <code>RESET</code> in the box below
+            and click Confirm.
+          </p>
+          <input
+            type="text"
+            className="input w-40 font-mono text-sm"
+            placeholder="Type RESET"
+            value={typedConfirm}
+            onChange={(e) => setTypedConfirm(e.target.value)}
+            disabled={mut.isPending}
+            autoFocus
+          />
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              className="btn-danger"
+              disabled={!canConfirm || mut.isPending}
+              onClick={() => mut.mutate()}
+            >
+              {mut.isPending ? 'Wiping reference data…' : 'Confirm Master Reset'}
+            </button>
+            <button
+              type="button"
+              className="btn-secondary"
+              disabled={mut.isPending}
+              onClick={() => { setConfirming(false); setTypedConfirm(''); }}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {mut.isSuccess && (
+        <div className="mt-3 rounded-md border border-success-200 bg-success-50 dark:bg-success-900/20 p-3 text-sm text-success-800 dark:text-success-200 space-y-1">
+          <div className="flex items-center gap-2 font-medium">
+            <CheckCircle2 className="w-4 h-4" aria-hidden />
+            Master Reset complete — {mut.data?.rows_deleted_total ?? 0} rows removed.
+          </div>
+          {mut.data?.by_table && (
+            <ul className="text-xs ml-6 list-disc">
+              {Object.entries(mut.data.by_table).map(([table, n]) => (
+                <li key={table}><code>{table}</code>: {n.toLocaleString()} rows</li>
+              ))}
+            </ul>
+          )}
+          <p className="text-xs">
+            Re-upload your reference files (Crosswalk, Weights+Fees, APG Base
+            Rates, DTC Rates) using the cards above to repopulate.
+          </p>
+        </div>
+      )}
+
+      {mut.isError && (
+        <div className="mt-3">
+          <span className="pill-danger">
+            <AlertCircle className="w-3 h-3" aria-hidden />
+            {extractErrorMessage(mut.error)}
+          </span>
         </div>
       )}
     </div>

@@ -126,6 +126,16 @@ export async function reloadDtcBaseRates(file) {
   return data;
 }
 
+// Admin: nuke every APG/CMS reference table so fresh uploads start clean.
+// Preserves users, audit log, providers, claims, county/locality tables.
+// Returns { ok, rows_deleted_total, by_table, preserved }.
+export async function masterResetReferenceData() {
+  const { data } = await apiClient.delete('/api/admin/master-reset-reference-data', {
+    timeout: 60_000,
+  });
+  return data;
+}
+
 // Admin: upload PMTAC's "Updated APG Fee Calculator" workbook. Replaces
 // every source='dtc' row in apg_base_rates from the 'Updated APG Base Rate'
 // sheet (all freestanding peer groups × Upstate/Downstate × historical

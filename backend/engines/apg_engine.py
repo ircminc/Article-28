@@ -388,6 +388,40 @@ class APGEngine:
                 elif not ctx.fee_scheduled:
                     ctx.notes.append(f"No EAPG mapping for HCPCS {code} on {dos.isoformat()}.")
 
+            # ---- Visit-purpose ICD override for Incidental placeholders ----
+            # Per NYS DOH / Solventum v3.18 methodology, all standalone E/M
+            # codes (99202–99215, etc.) map to type=Incidental in the HCPCS
+            # crosswalk. They are placeholders — the *real* EAPG for that
+            # outpatient visit comes from the principal diagnosis via the
+            # ICD-10 → EAPG sheet (the "visit-purpose adjusted" EAPG).
+            #
+            # Without this override, every standalone E/M visit packages to
+            # $0 because EAPG 491 has weight 0. With it, 99213 + E11.9
+            # correctly resolves to the diabetes EAPG (713) and pays the
+            # corresponding rate.
+            if (
+                ctx.eapg_type == EapgType.INCIDENTAL
+                and claim.principal_diagnosis
+            ):
+                icd_hit = await self.lookup_icd10_eapg(
+                    session, claim.principal_diagnosis, dos,
+                )
+                if icd_hit is not None and icd_hit.eapg != ctx.eapg:
+                    placeholder_eapg = ctx.eapg
+                    ctx.notes.append(
+                        f"Visit-purpose adjustment: HCPCS {code} maps to "
+                        f"Incidental placeholder EAPG {placeholder_eapg}; "
+                        f"using ICD-10 {claim.principal_diagnosis}'s "
+                        f"EAPG {icd_hit.eapg}"
+                        + (f" ({icd_hit.eapg_desc})" if icd_hit.eapg_desc else "")
+                        + " instead."
+                    )
+                    ctx.eapg = icd_hit.eapg
+                    ctx.eapg_desc = icd_hit.eapg_desc or icd_hit.description
+                    ctx.eapg_type_raw = icd_hit.eapg_type
+                    ctx.eapg_type = _coerce_eapg_type(icd_hit.eapg_type)
+                    ctx.eapg_category = icd_hit.eapg_category
+
             # Fall back to principal diagnosis if HCPCS didn't yield an EAPG
             if ctx.eapg is None and claim.principal_diagnosis:
                 hit = await self.lookup_icd10_eapg(session, claim.principal_diagnosis, dos)
