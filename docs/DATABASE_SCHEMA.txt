@@ -1,0 +1,624 @@
+================================================================================
+APG 835/837 RATE ANALYZER — DATABASE SCHEMA REFERENCE
+================================================================================
+
+Source of truth: backend/db/database.py (SQLAlchemy 2.0 ORM models)
+Current engine:  SQLite (file: backend/data/apg_analyzer.db, async via aiosqlite)
+Target ports:    SQL Server (any modern version), PostgreSQL (asyncpg)
+
+Type-mapping conventions for ports:
+  Python type         | SQLite        | SQL Server         | PostgreSQL
+  -----------------   | ------------- | ------------------ | ----------------
+  Mapped[int] (PK)    | INTEGER       | INT IDENTITY(1,1)  | SERIAL
+  Mapped[str](N)      | VARCHAR(N)    | NVARCHAR(N)        | VARCHAR(N)
+  Mapped[Decimal]     | NUMERIC(p,s)  | DECIMAL(p,s)       | NUMERIC(p,s)
+  Mapped[date]        | DATE          | DATE               | DATE
+  Mapped[datetime]    | DATETIME      | DATETIME2          | TIMESTAMP
+  Mapped[bool]        | INTEGER 0/1   | BIT                | BOOLEAN
+  Mapped[dict] (JSON) | TEXT (JSON)   | NVARCHAR(MAX)      | JSONB
+                                       (or JSON column in
+                                        SQL Server 2016+)
+
+Decimal precisions are LOAD-BEARING. Money fields use 14-digit precision with
+2 decimal places (NUMERIC(14,2)) — never widen to float when porting. APG
+weights use NUMERIC(12,6) to preserve six decimal places of relative weight.
+
+All identifier columns named `id` are surrogate primary keys with auto-
+increment. Foreign keys named `<entity>_id_fk` reference the parent's `id`
+column with the cascade behavior noted on each table.
+
+================================================================================
+TABLE GROUPS
+================================================================================
+
+  Reference data (loaded from NYS DOH / eMedNY / PMTAC / CMS files):
+    1. hcpcs_to_eapg            HCPCS → EAPG crosswalk (~21,000 rows)
+    2. icd10_to_eapg            ICD-10 → EAPG crosswalk (~75,000 rows)
+    3. apg_weights              EAPG relative weights, long-form (~21,000 rows)
+    4. apg_base_rates           Base rates by peer group + region (~180 rows)
+    5. provider_county          NY county → Upstate/Downstate (62 rows)
+    6. px_based_weights         Procedure-specific weight overrides (~5,300 rows)
+    7. fee_schedule             Flat-rate procedure reimbursement (~2,100 rows)
+    8. zip_locality             CMS ZIP → MPFS locality (~40,000 rows)
+    9. cms_rate_cache           CMS MPFS API cache (24h TTL)
+
+  Auth + governance:
+    10. user_account            One row per human user (admin/analyst/viewer)
+    11. audit_log               HIPAA-aligned access log
+
+  Operational:
+    12. provider_config         Active provider's settings (one is_active=true row)
+    13. parsed_claim            One row per 835/837 CLP segment
+    14. parsed_service_line     Children of parsed_claim
+    15. claim_adjustment        CAS segments (claim- and line-level)
+    16. apg_result              Cached APG calculation per claim
+
+
+================================================================================
+1. hcpcs_to_eapg
+================================================================================
+PURPOSE  Maps HCPCS/CPT procedure codes to their EAPG assignments under
+         eMedNY's Solventum v3.18 taxonomy. Date-bounded by quarter.
+SOURCE   eMedNY APG Crosswalk workbook (APGcrosswalkMMDDYYYY.xlsx),
+         "HCPCS to EAPGs" sheet. Loaded by backend/db/init_crosswalk.py.
+LOAD     Replace-all on each upload.
+
+COLUMN                       | TYPE                | NOT NULL | NOTES
+-----------------------------|---------------------|----------|---------------
+id                           | INT (auto)          | yes      | PK
+hcpcs                        | VARCHAR(12)         | yes      | indexed
+description                  | VARCHAR(512)        | no       |
+eapg                         | INT                 | yes      | indexed
+eapg_desc                    | VARCHAR(512)        | no       |
+eapg_type                    | VARCHAR(64)         | no       | indexed; v3.18 string
+eapg_category                | VARCHAR(256)        | no       |
+eapg_service_line            | VARCHAR(32)         | no       |
+quarter_effective_date       | DATE                | no       | indexed
+quarter_end_date             | DATE                | no       | inclusive end
+mid_quarter_effective_date   | DATE                | no       |
+mid_quarter_end_date         | DATE                | no       |
+
+INDEXES
+  ix_hcpcs_eapg_code_date  (hcpcs, quarter_effective_date)
+
+LOOKUP RULE (engine):
+  WHERE hcpcs = :code
+    AND (quarter_effective_date IS NULL OR quarter_effective_date <= :dos)
+    AND (quarter_end_date       IS NULL OR quarter_end_date       >= :dos)
+  ORDER BY quarter_effective_date DESC NULLS LAST
+  LIMIT 1
+
+
+================================================================================
+2. icd10_to_eapg
+================================================================================
+PURPOSE  Maps ICD-10-CM diagnosis codes to their EAPG assignments. Used both
+         for the visit-purpose adjustment on Incidental E/M codes and for
+         pure-fallback EAPG resolution when HCPCS doesn't map.
+SOURCE   eMedNY APG Crosswalk, "ICD-10 DX to EAPGs" sheet.
+NORMALIZATION
+  dx_code is stored UPPER + DOTS-STRIPPED (e.g. 'I10.0' -> 'I100',
+  'i48.91' -> 'I4891'). Loader applies normalize_dx_code() before insert.
+  Engine applies the same normalizer on lookup so any user input format
+  resolves correctly.
+
+COLUMN              | TYPE          | NOT NULL | NOTES
+--------------------|---------------|----------|---------------------------
+id                  | INT (auto)    | yes      | PK
+dx_code             | VARCHAR(12)   | yes      | indexed; normalized form
+description         | VARCHAR(512)  | no       |
+gender              | VARCHAR(4)    | no       | '0' (any) | 'M' | 'F'
+eapg                | INT           | yes      | indexed
+eapg_desc           | VARCHAR(512)  | no       |
+eapg_type           | VARCHAR(64)   | no       | indexed
+eapg_category       | VARCHAR(256)  | no       |
+eapg_service_line   | VARCHAR(32)   | no       |
+effective_date      | DATE          | no       | indexed
+end_date            | DATE          | no       | inclusive
+
+INDEXES
+  ix_icd10_eapg_code_date  (dx_code, effective_date)
+
+
+================================================================================
+3. apg_weights
+================================================================================
+PURPOSE  Relative weight per EAPG by effective date. Used by the APG engine
+         to compute payment = weight × base_rate × adjustments.
+SOURCE   NYS DOH history_and_fee_schedule.xls, "Final APG Based Weights" sheet.
+SHAPE    Long form. One row per (apg, effective_date). At query time the
+         engine selects the most-recent effective_date <= DOS.
+
+         A "final rate" row uses sentinel effective_date = 9999-12-31 with
+         is_final_rate = true and year_rate set to the year it covers.
+         Engine prefers final_rate when year_rate >= year(dos).
+
+COLUMN          | TYPE          | NOT NULL | NOTES
+----------------|---------------|----------|----------------------------
+id              | INT (auto)    | yes      | PK
+apg             | INT           | yes      | indexed
+apg_description | VARCHAR(512)  | no       |
+effective_date  | DATE          | yes      | indexed; sentinel 9999-12-31 for final
+weight          | DECIMAL(12,6) | yes      | relative weight, 6dp
+is_final_rate   | BIT/BOOL      | yes      | default false
+year_rate       | INT           | no       | year covered when is_final_rate=true
+
+UNIQUE
+  uq_apg_weight_date  (apg, effective_date)
+
+
+================================================================================
+4. apg_base_rates
+================================================================================
+PURPOSE  Base rate (dollars per APG-weight unit) by source, peer group,
+         region, and effective date. Drives every APG line payment.
+SOURCE   PMTAC "Updated APG Fee Calculator" workbook ("Updated APG Base
+         Rate" sheet) for source='dtc'. Hospital rates from legacy workbook.
+SHAPE    Long form: one row per (source, peer_group, region, effective_date).
+
+COLUMN              | TYPE          | NOT NULL | NOTES
+--------------------|---------------|----------|----------------------------
+id                  | INT (auto)    | yes      | PK
+source              | VARCHAR(16)   | yes      | indexed; 'dtc' | 'hospital'
+peer_group          | VARCHAR(64)   | yes      | indexed; e.g. 'Clinic*',
+                                                | 'Amb Surg', 'Renal',
+                                                | 'School-Based Health Center
+                                                |  (SBHC)*', etc.
+cure_code           | VARCHAR(32)   | no       |
+base_rate_code      | VARCHAR(32)   | no       | NYS DOH rate code (e.g. '1407')
+blend_rate_code     | VARCHAR(32)   | no       | (e.g. '1411')
+capital_rate_code   | VARCHAR(32)   | no       | (e.g. '1409')
+region              | VARCHAR(16)   | yes      | indexed; 'Upstate' | 'Downstate'
+cheat_flag          | VARCHAR(32)   | no       | hospital-only metadata
+effective_date      | DATE          | yes      | indexed
+rate                | DECIMAL(12,4) | yes      | dollars
+
+INDEXES
+  ix_base_rate_lookup  (source, peer_group, region, effective_date)
+
+LOOKUP RULE (engine):
+  WHERE source         = :provider_type
+    AND peer_group     = :peer_group       -- exact match, no fuzzing
+    AND region         = :region
+    AND effective_date <= :dos
+  ORDER BY effective_date DESC
+  LIMIT 1
+
+
+================================================================================
+5. provider_county
+================================================================================
+PURPOSE  NY county → Upstate/Downstate mapping. Drives region resolution
+         when a provider config has county_code but no explicit region.
+SOURCE   PMTAC "Updated APG Fee Calculator", "Provider County" sheet.
+
+COLUMN              | TYPE          | NOT NULL | NOTES
+--------------------|---------------|----------|----------------------------
+county_code         | INT           | yes      | PK (uses NYS DOH numeric code)
+county_name         | VARCHAR(64)   | yes      | unique, indexed
+                                                | (e.g. 'MANHATTAN', 'NIAGARA')
+health_home_phase   | VARCHAR(32)   | no       |
+region              | VARCHAR(16)   | yes      | 'Upstate' | 'Downstate'
+
+NOTES
+  NYC boroughs ARE in the table:
+    BRONX (58)        Downstate
+    BROOKLYN (59)     Downstate
+    MANHATTAN (60)    Downstate    -- note: NOT 'NEW YORK'
+    QUEENS (61)       Downstate
+    STATEN ISLAND (62) Downstate
+  Niagara is county_code=29 (Upstate) and is occasionally confused with
+  Manhattan in UI dropdowns by accident — verify the stored county_code
+  matches what users intend.
+
+
+================================================================================
+6. px_based_weights
+================================================================================
+PURPOSE  HCPCS-specific weight OVERRIDE. When a procedure has a non-zero
+         row here for the given DOS, this weight replaces the apg_weights
+         lookup. (Priority #2 in the engine's pricing ladder.)
+SOURCE   NYS DOH history_and_fee_schedule.xls, "Final Px Based Weights".
+
+COLUMN          | TYPE          | NOT NULL | NOTES
+----------------|---------------|----------|----------------------------
+id              | INT (auto)    | yes      | PK
+hcpcs           | VARCHAR(12)   | yes      | indexed
+description     | VARCHAR(256)  | no       |
+effective_date  | DATE          | yes      | indexed
+weight          | DECIMAL(12,6) | yes      | relative weight
+units_limit     | DECIMAL(10,2) | no       | max units per visit, optional
+
+INDEXES
+  ix_px_weight_lookup  (hcpcs, effective_date)
+
+
+================================================================================
+7. fee_schedule
+================================================================================
+PURPOSE  Flat-rate fee for specific HCPCS codes. When present and non-zero,
+         the line pays reimbursement × min(units, max_units) and the APG
+         formula is BYPASSED entirely. (Priority #1 in the pricing ladder.)
+SOURCE   NYS DOH history_and_fee_schedule.xls, "Fee Schedule" sheet.
+
+COLUMN          | TYPE          | NOT NULL | NOTES
+----------------|---------------|----------|----------------------------
+id              | INT (auto)    | yes      | PK
+hcpcs           | VARCHAR(12)   | yes      | indexed
+description     | VARCHAR(256)  | no       |
+effective_date  | DATE          | yes      | indexed
+reimbursement   | DECIMAL(12,2) | yes      | dollars (flat rate per unit)
+max_units       | DECIMAL(10,2) | no       | clamps billed units to this value
+
+INDEXES
+  ix_fee_schedule_lookup  (hcpcs, effective_date)
+
+
+================================================================================
+8. zip_locality
+================================================================================
+PURPOSE  CMS ZIP code → Medicare locality mapping. Used by the CMS engine
+         to resolve a provider's ZIP to the locality required by the MPFS API.
+SOURCE   CMS annual ZIP5 file:
+         https://www.cms.gov/medicare/medicare-fee-service-payments/
+         physicianfeesched/zip-code-carrier-locality-file
+LOAD     backend/db/init_zip_locality.py
+
+COLUMN          | TYPE          | NOT NULL | NOTES
+----------------|---------------|----------|----------------------------
+id              | INT (auto)    | yes      | PK
+zip_code        | VARCHAR(10)   | yes      | indexed (5 or 9 digit)
+state           | VARCHAR(2)    | no       |
+carrier_number  | VARCHAR(16)   | no       |
+locality_number | VARCHAR(8)    | yes      | indexed
+locality_name   | VARCHAR(128)  | no       |
+rural_indicator | VARCHAR(4)    | no       |
+plus4_flag      | VARCHAR(4)    | no       |
+effective_year  | INT           | no       | indexed
+
+INDEXES
+  ix_zip_locality_lookup  (zip_code, effective_year)
+
+
+================================================================================
+9. cms_rate_cache
+================================================================================
+PURPOSE  Cache of CMS MPFS rate API responses. Hits the live DKAN API at
+         pfs.data.cms.gov on miss; serves cached row when fresh.
+TTL      24h (cached_until column). Stale rows are still returned if the
+         live API is unreachable (soft-cache fallback).
+
+COLUMN              | TYPE          | NOT NULL | NOTES
+--------------------|---------------|----------|----------------------------
+id                  | INT (auto)    | yes      | PK
+hcpcs               | VARCHAR(12)   | yes      | indexed
+modifier            | VARCHAR(4)    | yes      | default '' (empty string)
+locality            | VARCHAR(8)    | yes      | indexed
+year                | INT           | yes      | indexed
+non_facility_rate   | DECIMAL(12,4) | no       |
+facility_rate       | DECIMAL(12,4) | no       |
+work_rvu            | DECIMAL(10,4) | no       |
+pe_rvu              | DECIMAL(10,4) | no       | practice expense
+mp_rvu              | DECIMAL(10,4) | no       | malpractice
+total_rvu           | DECIMAL(10,4) | no       |
+conversion_factor   | DECIMAL(10,4) | no       |
+raw_payload         | JSON          | no       | full API response, audit trail
+cached_at           | DATETIME      | yes      | when stored
+cached_until        | DATETIME      | yes      | indexed; TTL upper bound
+
+UNIQUE
+  uq_cms_cache_key  (hcpcs, modifier, locality, year)
+
+
+================================================================================
+10. user_account
+================================================================================
+PURPOSE  One row per human user. Argon2id password hashes; soft-delete via
+         `disabled` flag preserves audit history.
+
+ROLES    'admin'    can create/disable users, change passwords, master reset
+         'analyst'  default; can upload claims, run the calculator
+         'viewer'   read-only; no upload, no provider-config writes
+
+COLUMN                  | TYPE          | NOT NULL | NOTES
+------------------------|---------------|----------|----------------------------
+id                      | INT (auto)    | yes      | PK
+username                | VARCHAR(64)   | yes      | unique, indexed
+full_name               | VARCHAR(128)  | no       |
+email                   | VARCHAR(128)  | no       |
+password_hash           | VARCHAR(256)  | yes      | Argon2id encoded
+role                    | VARCHAR(16)   | yes      | default 'analyst', indexed
+disabled                | BIT/BOOL      | yes      | default false, indexed
+created_at              | DATETIME      | yes      | UTC
+last_login_at           | DATETIME      | no       | UTC
+password_changed_at     | DATETIME      | yes      | UTC; set on rotate
+
+
+================================================================================
+11. audit_log
+================================================================================
+PURPOSE  HIPAA-aligned access / mutation log. Append-only. One row per
+         security-relevant action.
+
+ACTIONS we emit:
+  login.success | login.failure | logout
+  user.create | user.disable | user.password_change
+  upload.835i | upload.835p | upload.837
+  provider.update
+  crosswalk.reload | weights_history.reload | dtc_rates.reload
+  apg_base_rates_v2.reload | reference_data.reload
+  reference_data.master_reset
+  cms_cache.clear
+  export.excel | export.pdf
+  claims.clear
+
+COLUMN              | TYPE          | NOT NULL | NOTES
+--------------------|---------------|----------|----------------------------
+id                  | INT (auto)    | yes      | PK
+occurred_at         | DATETIME      | yes      | indexed; UTC
+user_id             | INT           | no       | FK -> user_account.id (SET NULL on delete)
+                                                | indexed; null after user purge
+username_at_event   | VARCHAR(64)   | no       | snapshot at the time
+action              | VARCHAR(64)   | yes      | indexed; see list above
+resource            | VARCHAR(512)  | no       | free-form context
+ip_address          | VARCHAR(45)   | no       | IPv6-sized
+success             | BIT/BOOL      | yes      | default true
+details             | JSON          | no       | structured per-action payload
+
+
+================================================================================
+12. provider_config
+================================================================================
+PURPOSE  Single active provider's APG settings. Drives base-rate selection,
+         capital add-on eligibility, CMS locality.
+SHAPE    One is_active=true row at a time. Old configs are kept (is_active
+         flipped to false) for audit history.
+
+COLUMN                  | TYPE          | NOT NULL | NOTES
+------------------------|---------------|----------|----------------------------
+id                      | INT (auto)    | yes      | PK
+is_active               | BIT/BOOL      | yes      | default true, indexed
+provider_name           | VARCHAR(128)  | yes      |
+npi                     | VARCHAR(16)   | no       |
+county_code             | INT           | no       | FK-shaped reference to
+                                                    | provider_county.county_code
+                                                    | (no formal FK enforced)
+region                  | VARCHAR(16)   | no       | derived from county
+                                                    | 'Upstate' | 'Downstate'
+peer_group              | VARCHAR(64)   | yes      | matches apg_base_rates.peer_group
+provider_type           | VARCHAR(16)   | yes      | 'dtc' | 'hospital'
+capital_addon_eligible  | BIT/BOOL      | yes      | default false
+capital_addon_rate      | DECIMAL(12,4) | no       | flat $ added to claim total
+rate_code_override      | VARCHAR(16)   | no       | overrides base_rate_code lookup
+cms_locality            | VARCHAR(16)   | no       |
+updated_at              | DATETIME      | yes      | UTC; set on insert + update
+
+
+================================================================================
+13. parsed_claim
+================================================================================
+PURPOSE  One row per CLP segment from a parsed 835/837 file. Header-level
+         claim data; service lines are children, adjustments are children.
+
+COLUMN                  | TYPE          | NOT NULL | NOTES
+------------------------|---------------|----------|----------------------------
+id                      | INT (auto)    | yes      | PK
+file_id                 | VARCHAR(64)   | yes      | indexed; upload batch id
+file_type               | VARCHAR(8)    | yes      | indexed; '835I'|'835P'|'837I'|'837P'
+payer_name              | VARCHAR(128)  | no       |
+payer_id                | VARCHAR(32)   | no       |
+provider_npi            | VARCHAR(16)   | no       | indexed
+provider_name           | VARCHAR(128)  | no       |
+claim_id                | VARCHAR(64)   | yes      | indexed; CLP01
+patient_name            | VARCHAR(128)  | no       |
+patient_id              | VARCHAR(64)   | no       |
+date_of_service         | DATE          | no       | indexed
+claim_status            | VARCHAR(8)    | no       | CLP02
+billed_amount           | DECIMAL(14,2) | yes      | default 0
+allowed_amount          | DECIMAL(14,2) | yes      | default 0
+paid_amount             | DECIMAL(14,2) | yes      | default 0
+patient_responsibility  | DECIMAL(14,2) | yes      | default 0
+claim_filing_indicator  | VARCHAR(4)    | no       | CLP09
+principal_diagnosis     | VARCHAR(16)   | no       | normalized (upper, no dots)
+other_diagnoses         | JSON          | no       | list[str] of dx codes
+linked_claim_id_fk      | INT           | no       | FK -> parsed_claim.id
+                                                    | (SET NULL on delete);
+                                                    | links 835 to its 837 sibling
+                                                    | when both are uploaded
+created_at              | DATETIME      | yes      | UTC
+
+CHILDREN (cascade delete):
+  parsed_service_line    (via claim_id_fk)
+  claim_adjustment       (via claim_id_fk)
+  apg_result             (1:1 via claim_id_fk)
+
+
+================================================================================
+14. parsed_service_line
+================================================================================
+PURPOSE  One row per SVC/SV1/SV2 line on the claim. Each line's procedure
+         drives its EAPG assignment.
+
+COLUMN          | TYPE          | NOT NULL | NOTES
+----------------|---------------|----------|----------------------------
+id              | INT (auto)    | yes      | PK
+claim_id_fk     | INT           | yes      | FK -> parsed_claim.id (CASCADE)
+                                            | indexed
+line_seq        | INT           | yes      | LX01 sequence within claim
+procedure_code  | VARCHAR(12)   | yes      | indexed; HCPCS/CPT
+modifiers       | JSON          | no       | list[str] e.g. ['U6']
+revenue_code    | VARCHAR(8)    | no       |
+billed_amount   | DECIMAL(14,2) | yes      | default 0
+allowed_amount  | DECIMAL(14,2) | yes      | default 0
+paid_amount     | DECIMAL(14,2) | yes      | default 0
+units           | INT           | yes      | default 1
+date_of_service | DATE          | no       | usually inherits from claim
+
+
+================================================================================
+15. claim_adjustment
+================================================================================
+PURPOSE  One row per CAS segment. Both claim-level (line_seq is null) and
+         line-level adjustments are recorded here.
+
+COLUMN          | TYPE          | NOT NULL | NOTES
+----------------|---------------|----------|----------------------------
+id              | INT (auto)    | yes      | PK
+claim_id_fk     | INT           | yes      | FK -> parsed_claim.id (CASCADE)
+                                            | indexed
+line_seq        | INT           | no       | null = claim-level adjustment
+group_code      | VARCHAR(4)    | yes      | CO | PR | OA | PI | CR
+reason_code     | VARCHAR(8)    | yes      | CARC code
+amount          | DECIMAL(14,2) | yes      |
+quantity        | INT           | no       |
+
+
+================================================================================
+16. apg_result
+================================================================================
+PURPOSE  Cached APG calculation per claim. Refreshed on reprocess.
+SHAPE    1:1 with parsed_claim. Primary key = claim_id_fk (no separate id).
+
+COLUMN                  | TYPE          | NOT NULL | NOTES
+------------------------|---------------|----------|----------------------------
+claim_id_fk             | INT           | yes      | PK + FK -> parsed_claim.id (CASCADE)
+correct_apg_payment     | DECIMAL(14,2) | yes      | engine output
+actual_paid             | DECIMAL(14,2) | yes      | from 835
+variance                | DECIMAL(14,2) | yes      | correct - actual
+compression_pct         | DECIMAL(10,4) | yes      | variance / correct × 100
+underpaid               | BIT/BOOL      | yes      | default false
+overpaid                | BIT/BOOL      | yes      | default false
+base_rate_applied       | DECIMAL(12,4) | yes      | snapshot of base rate used
+peer_group              | VARCHAR(64)   | yes      | snapshot
+region                  | VARCHAR(16)   | yes      | snapshot
+discounting_applied     | BIT/BOOL      | yes      | default false
+u6_applied              | BIT/BOOL      | yes      | default false
+capital_applied         | BIT/BOOL      | yes      | default false
+line_details            | JSON          | yes      | serialized APGLineResult[]:
+                                                    | per-line eapg, weight,
+                                                    | expected/actual/variance,
+                                                    | packaged/discounted flags,
+                                                    | and the engine notes
+                                                    | (e.g. "Visit-purpose
+                                                    |  adjustment: ...")
+calculated_at           | DATETIME      | yes      | UTC
+
+
+================================================================================
+RELATIONSHIPS (cascade behavior)
+================================================================================
+
+  parsed_claim
+    └── parsed_service_line       (1:N, ON DELETE CASCADE)
+    └── claim_adjustment          (1:N, ON DELETE CASCADE)
+    └── apg_result                (1:1, ON DELETE CASCADE)
+    └── parsed_claim (self-ref)   (linked_claim_id_fk, ON DELETE SET NULL)
+
+  user_account
+    └── audit_log                 (1:N, ON DELETE SET NULL)
+                                  (preserves audit rows after user purge)
+
+  No formal FK is declared on:
+    provider_config.county_code -> provider_county.county_code
+  (kept loose so reload of provider_county doesn't cascade-clobber configs)
+
+
+================================================================================
+INDEX SUMMARY (for query planner)
+================================================================================
+
+Lookup-critical indexes (driven by APG engine queries):
+
+  hcpcs_to_eapg
+    - ix_hcpcs_eapg_code_date  (hcpcs, quarter_effective_date)
+  icd10_to_eapg
+    - ix_icd10_eapg_code_date  (dx_code, effective_date)
+  apg_weights
+    - uq_apg_weight_date       (apg, effective_date)            UNIQUE
+  apg_base_rates
+    - ix_base_rate_lookup      (source, peer_group, region, effective_date)
+  px_based_weights
+    - ix_px_weight_lookup      (hcpcs, effective_date)
+  fee_schedule
+    - ix_fee_schedule_lookup   (hcpcs, effective_date)
+  cms_rate_cache
+    - uq_cms_cache_key         (hcpcs, modifier, locality, year) UNIQUE
+  zip_locality
+    - ix_zip_locality_lookup   (zip_code, effective_year)
+
+Single-column indexes (additional, for filter columns):
+  hcpcs, eapg, eapg_type on hcpcs_to_eapg
+  dx_code, eapg, eapg_type on icd10_to_eapg
+  apg on apg_weights
+  source, peer_group, region on apg_base_rates
+  hcpcs on px_based_weights, fee_schedule
+  username, role, disabled on user_account
+  occurred_at, user_id, action on audit_log
+  is_active on provider_config
+  file_id, file_type, claim_id, date_of_service, provider_npi on parsed_claim
+  claim_id_fk on parsed_service_line, claim_adjustment
+
+
+================================================================================
+PORTING NOTES
+================================================================================
+
+A. JSON columns (other_diagnoses, modifiers, line_details, raw_payload, details)
+   - SQLite        : TEXT (we serialize/deserialize in app code)
+   - SQL Server    : NVARCHAR(MAX) on 2014-, JSON column type 2016+
+                     EF Core: HasConversion(...) or .HasJsonProperty(...)
+                     EF6:     ValueConversion is not native; do it in the
+                              entity getter/setter or via DbCommandInterceptor
+   - PostgreSQL    : JSONB (preferred), with GIN index if you query into it
+
+B. Boolean columns
+   - SQLite        : INTEGER 0/1 transparently
+   - SQL Server    : BIT (0/1). EF6 maps bool <-> bit cleanly.
+   - PostgreSQL    : BOOLEAN
+
+C. Default timestamps
+   The Python service writes UTC datetimes via datetime.utcnow() in code.
+   When porting:
+   - EF Core / EF6 : set default in OnModelCreating with HasDefaultValueSql
+                     ('GETUTCDATE()' for SQL Server)
+   - Or keep app-level defaults to match Python behavior exactly.
+
+D. Decimal precision (REPEAT — important)
+   Money columns use DECIMAL(14,2). APG weights use DECIMAL(12,6).
+   Base rates use DECIMAL(12,4). Compression percentage uses DECIMAL(10,4).
+   These precisions are LOAD-BEARING. Do not widen to FLOAT/REAL/DOUBLE
+   anywhere in the chain — money math must remain exact.
+
+E. String column lengths
+   These were chosen to match observed source data + reasonable headroom.
+   Increasing them is harmless; shrinking risks truncation (especially
+   eapg_desc and description which can be long-form clinical text).
+
+F. Identifier/sequence semantics
+   Python/SQLite   : INTEGER PRIMARY KEY autoincrement
+   SQL Server      : INT IDENTITY(1,1)
+   PostgreSQL      : SERIAL or BIGSERIAL
+   Existing data exports do NOT include IDs; downstream re-inserts get
+   fresh IDs. Don't try to preserve PKs across a port — relationships
+   are by foreign keys, which the ORM remaps.
+
+G. Cascade behavior
+   parsed_claim -> children: ON DELETE CASCADE  (clearing a claim drops
+                                                  all its lines/CAS/APG rows)
+   user_account -> audit_log: ON DELETE SET NULL (audit rows survive a
+                                                  user purge for compliance)
+   linked_claim_id_fk:        ON DELETE SET NULL (un-linking, not cascade)
+   Preserve these exactly when porting — they encode policy decisions.
+
+H. Master Reset semantics (admin-only; see DELETE
+   /api/admin/master-reset-reference-data)
+   WIPES:    apg_base_rates, hcpcs_to_eapg, icd10_to_eapg, apg_weights,
+             px_based_weights, fee_schedule, cms_rate_cache
+   PRESERVES: user_account, audit_log, provider_config, provider_county,
+              zip_locality, parsed_claim, parsed_service_line,
+              claim_adjustment, apg_result
+   Use /api/claims (DELETE) to clear claim history separately.
+
+================================================================================
+END
+================================================================================
